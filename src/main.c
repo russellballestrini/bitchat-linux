@@ -552,6 +552,10 @@ static int cmd_chat(int use_testnet, const char *adapter,
         }
         if (pfds[0].revents & POLLIN) bc_ble_process(g_chat.ble);
 
+        /* Drive the BLE Connect scheduler every tick so jittered
+         * reconnects actually fire. */
+        bc_ble_tick(g_chat.ble);
+
         /* Fire any pending post-subscribe replay once BlueZ has wired up
          * its forward path. on_peer_chat arms this on start-notify; the
          * delay lets BlueZ finish the StartNotify → BLE-forward handshake

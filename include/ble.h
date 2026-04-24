@@ -63,6 +63,7 @@ void bc_ble_stop(bc_ble_ctx_t *ctx);
  * stdin for interactive chat) can use these instead of bc_ble_run. */
 int  bc_ble_get_fd(bc_ble_ctx_t *ctx);     /* returns sd_bus fd to poll */
 int  bc_ble_process(bc_ble_ctx_t *ctx);    /* drains pending sd-bus events once */
+void bc_ble_tick(bc_ble_ctx_t *ctx);       /* fires any due scheduled Connects */
 
 void bc_ble_free(bc_ble_ctx_t *ctx);
 

@@ -31,6 +31,7 @@
 #include <string.h>
 #include <strings.h>
 #include <time.h>
+#include <unistd.h>
 #include <systemd/sd-bus.h>
 
 #define BLUEZ_DEST        "org.bluez"
@@ -68,10 +69,17 @@ struct bc_ble_ctx {
     /* Remembered peer device paths that advertised our service UUID.
      * On Connected=0 for a known peer we re-dispatch Connect so the
      * mesh link comes back up without needing a fresh advertisement.
-     * last_connect_ms rate-limits reconnect dispatches per peer;
-     * without it BlueZ returns "Operation already in progress" and
-     * the connection never stabilises. */
+     * next_connect_at_ms[i] is the monotonic ms at which we are
+     * allowed to fire the next Connect for peer i; cleared when
+     * Connected=1 arrives, re-armed with a random jitter when the
+     * peer appears or disconnects. The jitter staggers which side
+     * initiates the link so two symmetric dual-role peers don't both
+     * Connect simultaneously and cancel each other out.
+     * last_connect_ms[i] is a hard-floor rate-limit on top of that
+     * so spurious repeated Connected=0 events can't bypass the jitter
+     * and spam BlueZ into "Operation already in progress". */
     char        *matched_peers[BC_MAX_PEERS];
+    uint64_t     next_connect_at_ms[BC_MAX_PEERS];
     uint64_t     last_connect_ms[BC_MAX_PEERS];
     int          matched_peer_count;
 
@@ -272,6 +280,8 @@ static int adapter_start_discovery(bc_ble_ctx_t *ctx) {
 }
 
 #define BC_RECONNECT_MIN_GAP_MS 1500
+#define BC_CONNECT_JITTER_MIN_MS 500
+#define BC_CONNECT_JITTER_MAX_MS 2500
 
 static uint64_t ble_now_ms(void) {
     struct timespec ts;
@@ -296,9 +306,34 @@ static void peer_remember(bc_ble_ctx_t *ctx, const char *path) {
     if (ctx->matched_peer_count >= BC_MAX_PEERS) return;
     char *dup = strdup(path);
     if (!dup) return;
-    ctx->matched_peers[ctx->matched_peer_count]   = dup;
-    ctx->last_connect_ms[ctx->matched_peer_count] = 0;
+    ctx->matched_peers[ctx->matched_peer_count]       = dup;
+    ctx->next_connect_at_ms[ctx->matched_peer_count]  = 0;
+    ctx->last_connect_ms[ctx->matched_peer_count]     = 0;
     ctx->matched_peer_count++;
+}
+
+/* Random jitter for staggering Connect attempts between two symmetric
+ * dual-role peers. Each peer picks an independent delay in [MIN,MAX];
+ * whichever side's timer fires first wins the Connect, the other side
+ * sees Connected=1 arrive and cancels its own pending attempt. */
+static uint64_t connect_jitter_ms(void) {
+    uint64_t span = BC_CONNECT_JITTER_MAX_MS - BC_CONNECT_JITTER_MIN_MS + 1;
+    return BC_CONNECT_JITTER_MIN_MS + (uint64_t)(rand() % (int)span);
+}
+
+static void schedule_connect(bc_ble_ctx_t *ctx, const char *path,
+                             const char *why) {
+    int idx = peer_index(ctx, path);
+    if (idx < 0) return;
+    uint64_t jitter = connect_jitter_ms();
+    ctx->next_connect_at_ms[idx] = ble_now_ms() + jitter;
+    ble_logf("%s: %s in %llums", why, path, (unsigned long long)jitter);
+}
+
+static void cancel_pending_connect(bc_ble_ctx_t *ctx, const char *path) {
+    int idx = peer_index(ctx, path);
+    if (idx < 0) return;
+    ctx->next_connect_at_ms[idx] = 0;
 }
 
 static int on_async_connect_reply(sd_bus_message *m, void *ud, sd_bus_error *e) {
@@ -406,10 +441,10 @@ static void handle_iface_entry(bc_ble_ctx_t *ctx, const char *path,
                                const char *iface, sd_bus_message *m) {
     if (strcmp(iface, DEVICE_IFACE) == 0) {
         if (device_props_match(m, ctx->service_uuid)) {
-            ble_logf("device: %s matches, connecting", path);
+            ble_logf("device: %s matches", path);
             peer_remember(ctx, path);
             if (ctx->peer_cb) ctx->peer_cb(path, "discover", ctx->user);
-            device_connect_async(ctx, path);
+            schedule_connect(ctx, path, "Connect scheduled");
         } else {
             sd_bus_message_skip(m, "a{sv}");
         }
@@ -498,10 +533,16 @@ static int on_properties_changed(sd_bus_message *m, void *userdata,
                              * exchange in some dual-role topologies. If this
                              * is a peer we've matched before, reconnect so
                              * the chat stream continues instead of stalling
-                             * on notifying=0. */
-                            if (!on && path && peer_known(ctx, path)) {
-                                ble_logf("reconnect: %s → Connect", path);
-                                device_connect_async(ctx, path);
+                             * on notifying=0. Jittered so the two symmetric
+                             * sides don't race their Connects and keep
+                             * canceling each other. */
+                            if (path && peer_known(ctx, path)) {
+                                if (on) {
+                                    cancel_pending_connect(ctx, path);
+                                } else {
+                                    schedule_connect(ctx, path,
+                                                     "reconnect scheduled");
+                                }
                             }
                         } else {
                             sd_bus_message_skip(m, "v");
@@ -907,6 +948,14 @@ bc_ble_ctx_t *bc_ble_new(bc_ble_frame_cb_t frame_cb,
     ctx->user     = user;
     ctx->running  = 0;
 
+    /* Seed the connect-jitter RNG distinctly per (boot, pid) so two peers
+     * spinning up from the same binary image don't pick the same delay.
+     * rand() is fine here — we only need a few bits of entropy to break
+     * the symmetry between two symmetric dual-role peers. */
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    srand((unsigned)(ts.tv_nsec ^ (getpid() * 2654435761u)));
+
     int r = sd_bus_open_system(&ctx->bus);
     if (r < 0) {
         ble_logf("sd_bus_open_system: %s", strerror(-r));
@@ -972,7 +1021,12 @@ int bc_ble_run(bc_ble_ctx_t *ctx) {
 
         if (!ctx->running) break;
 
-        r = sd_bus_wait(ctx->bus, 1000000 /* 1s */);
+        bc_ble_tick(ctx);
+
+        /* 100ms wait so scheduled Connects fire within ~100ms of their
+         * deadline. Longer waits let the jitter deadline overshoot and
+         * defeat the stagger. */
+        r = sd_bus_wait(ctx->bus, 100000 /* 100ms */);
         if (r < 0 && r != -EINTR) {
             ble_logf("sd_bus_wait: %s", strerror(-r));
             return r;
@@ -997,6 +1051,20 @@ int bc_ble_process(bc_ble_ctx_t *ctx) {
         if (r < 0) return r;
     } while (r > 0);
     return 0;
+}
+
+/* Fire any scheduled Connect()s whose jitter deadline has passed.
+ * Callers drive this from their poll loop; bc_ble_run drives it
+ * inline between sd_bus_wait ticks. */
+void bc_ble_tick(bc_ble_ctx_t *ctx) {
+    if (!ctx) return;
+    uint64_t now = ble_now_ms();
+    for (int i = 0; i < ctx->matched_peer_count; i++) {
+        uint64_t due = ctx->next_connect_at_ms[i];
+        if (due == 0 || now < due) continue;
+        ctx->next_connect_at_ms[i] = 0;
+        device_connect_async(ctx, ctx->matched_peers[i]);
+    }
 }
 
 void bc_ble_free(bc_ble_ctx_t *ctx) {
