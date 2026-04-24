@@ -397,6 +397,54 @@ static int on_properties_changed(sd_bus_message *m, void *userdata,
     int r = sd_bus_message_read_basic(m, 's', &iface);
     if (r < 0 || !iface) return 0;
 
+    /* Log Device1 state changes for diagnostic visibility. */
+    if (strcmp(iface, DEVICE_IFACE) == 0) {
+        const char *path = sd_bus_message_get_path(m);
+        int r2 = sd_bus_message_enter_container(m, 'a', "{sv}");
+        if (r2 >= 0) {
+            while ((r2 = sd_bus_message_enter_container(m, 'e', "sv")) > 0) {
+                const char *key;
+                if (sd_bus_message_read_basic(m, 's', &key) >= 0) {
+                    if (strcmp(key, "Connected") == 0) {
+                        const char *contents;
+                        char t;
+                        sd_bus_message_peek_type(m, &t, &contents);
+                        if (t == 'v' && contents && strcmp(contents, "b") == 0) {
+                            sd_bus_message_enter_container(m, 'v', "b");
+                            int on = 0;
+                            sd_bus_message_read_basic(m, 'b', &on);
+                            sd_bus_message_exit_container(m);
+                            ble_logf("device %s: Connected=%d",
+                                     path ? path : "?", on);
+                        } else {
+                            sd_bus_message_skip(m, "v");
+                        }
+                    } else if (strcmp(key, "ServicesResolved") == 0) {
+                        const char *contents;
+                        char t;
+                        sd_bus_message_peek_type(m, &t, &contents);
+                        if (t == 'v' && contents && strcmp(contents, "b") == 0) {
+                            sd_bus_message_enter_container(m, 'v', "b");
+                            int on = 0;
+                            sd_bus_message_read_basic(m, 'b', &on);
+                            sd_bus_message_exit_container(m);
+                            ble_logf("device %s: ServicesResolved=%d",
+                                     path ? path : "?", on);
+                        } else {
+                            sd_bus_message_skip(m, "v");
+                        }
+                    } else {
+                        sd_bus_message_skip(m, "v");
+                    }
+                }
+                sd_bus_message_exit_container(m);
+            }
+            sd_bus_message_exit_container(m);
+        }
+        sd_bus_message_skip(m, "as");
+        return 0;
+    }
+
     /* We only care about characteristic Value changes. */
     if (strcmp(iface, GATT_CHAR_IFACE) != 0) {
         sd_bus_message_skip(m, "a{sv}as");
@@ -580,6 +628,10 @@ static int method_chrc_start_notify(sd_bus_message *m, void *ud, sd_bus_error *e
     bc_ble_ctx_t *ctx = (bc_ble_ctx_t *)ud;
     if (!ctx->notifying) {
         ctx->notifying = 1;
+        /* BlueZ needs this PropertiesChanged on Notifying to wire up its
+         * forward path from our D-Bus signal to BLE GATT notifications. */
+        sd_bus_emit_properties_changed(ctx->bus, CHAR_PATH,
+                                       GATT_CHAR_IFACE, "Notifying", NULL);
         ble_logf("peripheral: StartNotify (subscriber attached)");
         if (ctx->peer_cb) ctx->peer_cb("local-subscriber", "start-notify", ctx->user);
     }
@@ -590,6 +642,8 @@ static int method_chrc_stop_notify(sd_bus_message *m, void *ud, sd_bus_error *er
     bc_ble_ctx_t *ctx = (bc_ble_ctx_t *)ud;
     if (ctx->notifying) {
         ctx->notifying = 0;
+        sd_bus_emit_properties_changed(ctx->bus, CHAR_PATH,
+                                       GATT_CHAR_IFACE, "Notifying", NULL);
         ble_logf("peripheral: StopNotify");
         if (ctx->peer_cb) ctx->peer_cb("local-subscriber", "stop-notify", ctx->user);
     }
