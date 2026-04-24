@@ -3,6 +3,7 @@
 # Standard targets: all test clean install
 # Test targets:     unit integration functional functional-mock functional-mesh self-test
 # Setup targets:    deps (auto-detect) deps-apt deps-dnf deps-pacman deps-zypper
+# BlueZ targets:    ble-le-only ble-le-only-restore ble-restart ble-status
 #
 # Runtime deps:
 #   zlib, libsystemd (sd-bus for BlueZ), OpenSSL 3+ (Ed25519 / X25519 / SHA256)
@@ -40,7 +41,8 @@ PREFIX   ?= /usr/local
 BINDIR   ?= $(PREFIX)/bin
 
 .PHONY: all clean install test unit integration functional functional-mock functional-mesh self-test \
-        deps deps-apt deps-dnf deps-pacman deps-zypper
+        deps deps-apt deps-dnf deps-pacman deps-zypper \
+        ble-le-only ble-le-only-restore ble-restart ble-status
 
 all: $(BIN)
 
@@ -152,3 +154,36 @@ deps-zypper:
 	    zlib-devel systemd-devel libopenssl-devel \
 	    python3-dbus-python python3-gobject \
 	    bluez
+
+# --- BlueZ adapter prep ---
+#
+# bitchat is LE-only. On a dual-mode adapter that also has classic
+# Bluetooth devices paired (e.g. an A2DP headset), Device1.Connect
+# probes BR/EDR alongside LE and tears the LE link down when the
+# BR/EDR leg fails — the link comes up for ~1s then drops with
+# br-connection-canceled / br-connection-key-missing.
+#
+# `ble-le-only` reproduces what iOS/Android do: force the controller
+# into LE-only mode so Connect can't fall through to BR/EDR.
+# `ble-le-only-restore` puts BR/EDR back so headsets etc. work again.
+# Both target hci0 — set HCI=hciN to override.
+HCI ?= 0
+
+ble-le-only:
+	sudo systemctl restart bluetooth
+	sudo btmgmt --index $(HCI) power off
+	sudo btmgmt --index $(HCI) bredr off
+	sudo btmgmt --index $(HCI) power on
+	@echo "hci$(HCI) is now LE-only"
+
+ble-le-only-restore:
+	sudo btmgmt --index $(HCI) power off
+	sudo btmgmt --index $(HCI) bredr on
+	sudo btmgmt --index $(HCI) power on
+	@echo "hci$(HCI) BR/EDR re-enabled"
+
+ble-restart:
+	sudo systemctl restart bluetooth
+
+ble-status:
+	@btmgmt --index $(HCI) info | grep -E 'current settings|addr'
