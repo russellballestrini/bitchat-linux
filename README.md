@@ -24,10 +24,29 @@ traffic with TTL decrement + a 5-minute dedup cache.
 ## Build
 
 ```sh
-sudo apt install build-essential zlib1g-dev libsystemd-dev libssl-dev pkg-config
+make deps       # auto-detect distro, install zlib / libsystemd / openssl / python-dbus
 make
 make test
 ```
+
+`make deps` dispatches to the right package manager via `/etc/os-release`.
+If auto-detection misses, call the explicit target:
+
+```sh
+make deps-apt      # Debian, Ubuntu, Mint
+make deps-dnf      # Fedora, RHEL, CentOS, Rocky, AlmaLinux
+make deps-pacman   # Arch, Manjaro
+make deps-zypper   # openSUSE, SLES
+```
+
+Manual install (if you prefer):
+
+| Distro | Command |
+|--------|---------|
+| Debian/Ubuntu | `sudo apt install build-essential zlib1g-dev libsystemd-dev libssl-dev pkg-config python3-dbus python3-gi bluez` |
+| Fedora/RHEL   | `sudo dnf install gcc make pkgconf-pkg-config zlib-devel systemd-devel openssl-devel python3-dbus python3-gobject bluez` |
+| Arch          | `sudo pacman -S base-devel pkgconf zlib systemd openssl python-dbus python-gobject bluez bluez-utils` |
+| openSUSE      | `sudo zypper install gcc make pkg-config zlib-devel systemd-devel libopenssl-devel python3-dbus-python python3-gobject bluez` |
 
 ## Tests
 

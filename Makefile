@@ -1,14 +1,19 @@
 # bitchat-linux — C client
 #
 # Standard targets: all test clean install
-# Test targets: unit integration functional self-test
+# Test targets:     unit integration functional functional-mock functional-mesh self-test
+# Setup targets:    deps (auto-detect) deps-apt deps-dnf deps-pacman deps-zypper
 #
-# Runtime deps (Stage 1): zlib (libz)
-# Runtime deps (Stage 2): libsystemd (sd-bus, BlueZ D-Bus interface)
+# Runtime deps:
+#   zlib, libsystemd (sd-bus for BlueZ), OpenSSL 3+ (Ed25519 / X25519 / SHA256)
+# Test-only deps:
+#   python3 + dbus bindings (for tests/fake_peer.py — real-BLE functional test)
 #
-# Build:   make
-# Test:    make test        # runs unit + integration + self-test + functional
-# Clean:   make clean
+# First-time setup:
+#   make deps       # install runtime + test deps for your distro
+#   make            # build
+#   make test       # unit + self-test + functional + mock (skips mesh on 1-adapter box)
+#   make clean
 
 CC       ?= cc
 CFLAGS   ?= -O2 -g -Wall -Wextra -Wpedantic -std=c11
@@ -34,7 +39,8 @@ FIXTURE_BIN  := tests/build/make_fixture
 PREFIX   ?= /usr/local
 BINDIR   ?= $(PREFIX)/bin
 
-.PHONY: all clean install test unit integration functional functional-mock functional-mesh self-test
+.PHONY: all clean install test unit integration functional functional-mock functional-mesh self-test \
+        deps deps-apt deps-dnf deps-pacman deps-zypper
 
 all: $(BIN)
 
@@ -93,3 +99,56 @@ install: $(BIN)
 
 clean:
 	rm -rf build tests/build $(BIN)
+
+# --- dependency installation (distro-aware) ---
+#
+# Picks a package manager from /etc/os-release. If auto-detection fails
+# or you know which you want, call the explicit target directly.
+deps:
+	@if [ ! -f /etc/os-release ]; then \
+	    echo "can't auto-detect — /etc/os-release missing"; \
+	    echo "try: make deps-apt  |  deps-dnf  |  deps-pacman  |  deps-zypper"; \
+	    exit 1; \
+	fi; \
+	. /etc/os-release; \
+	case "$$ID $$ID_LIKE" in \
+	    *fedora*|*rhel*|*centos*|*rocky*|*almalinux*) $(MAKE) deps-dnf ;; \
+	    *debian*|*ubuntu*|*mint*)                     $(MAKE) deps-apt ;; \
+	    *arch*|*manjaro*|*endeavouros*)               $(MAKE) deps-pacman ;; \
+	    *opensuse*|*suse*|*sles*)                     $(MAKE) deps-zypper ;; \
+	    *) echo "unknown distro ($$ID $$ID_LIKE)"; \
+	       echo "try: make deps-apt | deps-dnf | deps-pacman | deps-zypper"; exit 1 ;; \
+	esac
+
+# Debian / Ubuntu / Mint
+deps-apt:
+	sudo apt-get update
+	sudo apt-get install -y \
+	    build-essential pkg-config \
+	    zlib1g-dev libsystemd-dev libssl-dev \
+	    python3-dbus python3-gi \
+	    bluez
+
+# Fedora / RHEL / CentOS / Rocky / AlmaLinux
+deps-dnf:
+	sudo dnf install -y \
+	    gcc make pkgconf-pkg-config \
+	    zlib-devel systemd-devel openssl-devel \
+	    python3-dbus python3-gobject \
+	    bluez
+
+# Arch / Manjaro
+deps-pacman:
+	sudo pacman -S --needed --noconfirm \
+	    base-devel pkgconf \
+	    zlib systemd openssl \
+	    python-dbus python-gobject \
+	    bluez bluez-utils
+
+# openSUSE / SLES
+deps-zypper:
+	sudo zypper install -y \
+	    gcc make pkg-config \
+	    zlib-devel systemd-devel libopenssl-devel \
+	    python3-dbus-python python3-gobject \
+	    bluez
