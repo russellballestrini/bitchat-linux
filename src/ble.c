@@ -729,40 +729,22 @@ int bc_ble_broadcast(bc_ble_ctx_t *ctx, const uint8_t *data, size_t len) {
     if (!ctx->peripheral_enabled) return 0;
     if (len > sizeof(ctx->current_value)) return -E2BIG;
 
-    /* Stash the frame so any later ReadValue returns something meaningful. */
+    /* Stash the frame so ReadValue + the property getter see the new bytes,
+     * then ask sd-bus to emit a canonical PropertiesChanged("Value") signal.
+     * BlueZ picks that up and forwards it over BLE as a GATT notification
+     * to every subscribed central. Using the raw sd_bus_message_new_signal
+     * path tended to be ignored by BlueZ — this is the supported pattern. */
     memcpy(ctx->current_value, data, len);
     ctx->current_value_len = len;
 
-    /* Emit PropertiesChanged on the characteristic with the new Value. */
-    sd_bus_message *m = NULL;
-    int r = sd_bus_message_new_signal(ctx->bus, &m, CHAR_PATH,
-                                      PROPS_IFACE, "PropertiesChanged");
-    if (r < 0) return r;
-    r = sd_bus_message_append_basic(m, 's', GATT_CHAR_IFACE);
-    if (r < 0) goto done;
-    r = sd_bus_message_open_container(m, 'a', "{sv}");
-    if (r < 0) goto done;
-    r = sd_bus_message_open_container(m, 'e', "sv");
-    if (r < 0) goto done;
-    r = sd_bus_message_append_basic(m, 's', "Value");
-    if (r < 0) goto done;
-    r = sd_bus_message_open_container(m, 'v', "ay");
-    if (r < 0) goto done;
-    r = sd_bus_message_append_array(m, 'y', data, len);
-    if (r < 0) goto done;
-    r = sd_bus_message_close_container(m);   /* close v */
-    if (r < 0) goto done;
-    r = sd_bus_message_close_container(m);   /* close e */
-    if (r < 0) goto done;
-    r = sd_bus_message_close_container(m);   /* close a */
-    if (r < 0) goto done;
-    r = sd_bus_message_append(m, "as", 0);   /* empty invalidated array */
-    if (r < 0) goto done;
-    r = sd_bus_send(ctx->bus, m, NULL);
-done:
-    sd_bus_message_unref(m);
-    if (r < 0) ble_logf("broadcast emit failed: %s", strerror(-r));
-    return r < 0 ? r : 0;
+    int r = sd_bus_emit_properties_changed(ctx->bus, CHAR_PATH,
+                                           GATT_CHAR_IFACE, "Value", NULL);
+    if (r < 0) {
+        ble_logf("broadcast emit failed: %s", strerror(-r));
+        return r;
+    }
+    ble_logf("broadcast %zu bytes (notifying=%d)", len, ctx->notifying);
+    return 0;
 }
 
 /* ---------- public API ---------- */

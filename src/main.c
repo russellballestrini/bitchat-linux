@@ -301,11 +301,42 @@ typedef struct {
     bc_identity_t  id;
     bc_dedup_t    *dedup;
     bc_ble_ctx_t  *ble;
+    const char    *nickname;
     int            use_testnet;
     int            relay;
 } chat_ctx_t;
 
 static chat_ctx_t g_chat;
+
+/* Queue of recent outbound frames — re-sent when a new subscriber attaches,
+ * so messages typed before the peer joined aren't lost. */
+#define BC_SEND_QUEUE_DEPTH 16
+typedef struct {
+    uint8_t buf[1024];
+    size_t  len;
+} sent_frame_t;
+static sent_frame_t sent_queue[BC_SEND_QUEUE_DEPTH];
+static int sent_queue_head = 0;  /* next slot to overwrite */
+static int sent_queue_count = 0;
+
+static void sent_queue_push(const uint8_t *data, size_t len) {
+    if (len == 0 || len > sizeof(sent_queue[0].buf)) return;
+    sent_frame_t *slot = &sent_queue[sent_queue_head];
+    memcpy(slot->buf, data, len);
+    slot->len = len;
+    sent_queue_head = (sent_queue_head + 1) % BC_SEND_QUEUE_DEPTH;
+    if (sent_queue_count < BC_SEND_QUEUE_DEPTH) sent_queue_count++;
+}
+
+static void sent_queue_replay(bc_ble_ctx_t *ble) {
+    /* Replay in chronological order: oldest first. */
+    int start = (sent_queue_head - sent_queue_count + BC_SEND_QUEUE_DEPTH)
+                % BC_SEND_QUEUE_DEPTH;
+    for (int i = 0; i < sent_queue_count; i++) {
+        int idx = (start + i) % BC_SEND_QUEUE_DEPTH;
+        bc_ble_broadcast(ble, sent_queue[idx].buf, sent_queue[idx].len);
+    }
+}
 
 static uint64_t now_ms(void) {
     struct timespec ts;
@@ -432,11 +463,27 @@ static void sigint_handler(int s) {
     if (g_ble_for_signal) bc_ble_stop(g_ble_for_signal);
 }
 
+/* Called by ble.c when a central subscribes (or anything else happens to a
+ * peer path). On a new subscription we replay the recent send queue so the
+ * peer sees our current presence without having to wait for the next
+ * periodic announce. */
+static void on_peer_chat(const char *peer_path, const char *event, void *user) {
+    chat_ctx_t *c = (chat_ctx_t *)user;
+    (void)peer_path;
+    if (strcmp(event, "start-notify") == 0 && c && c->ble) {
+        fprintf(stderr, "[chat] subscriber attached → replaying send queue\n");
+        sent_queue_replay(c->ble);
+    }
+}
+
 static int cmd_chat(int use_testnet, const char *adapter,
                     const char *nickname, int enable_relay) {
     memset(&g_chat, 0, sizeof(g_chat));
     g_chat.use_testnet = use_testnet;
     g_chat.relay = enable_relay;
+    g_chat.nickname = nickname;
+    sent_queue_head = 0;
+    sent_queue_count = 0;
 
     if (bc_identity_load_or_generate(NULL, &g_chat.id) != 0) {
         fprintf(stderr, "identity init failed\n");
@@ -451,7 +498,7 @@ static int cmd_chat(int use_testnet, const char *adapter,
     g_chat.dedup = bc_dedup_new();
     if (!g_chat.dedup) { fprintf(stderr, "dedup alloc\n"); return 1; }
 
-    g_chat.ble = bc_ble_new(on_frame_chat, NULL, &g_chat);
+    g_chat.ble = bc_ble_new(on_frame_chat, on_peer_chat, &g_chat);
     if (!g_chat.ble) { fprintf(stderr, "ble_new\n"); return 1; }
     g_ble_for_signal = g_chat.ble;
     signal(SIGINT,  sigint_handler);
@@ -466,10 +513,16 @@ static int cmd_chat(int use_testnet, const char *adapter,
         return 1;
     }
 
-    /* Announce immediately, then every 30s. */
+    /* Announce immediately, then every 5s. The short interval covers the
+     * gap between "peripheral advertises" and "remote central subscribes";
+     * a subscriber that joins mid-interval will also trigger a send-queue
+     * replay via on_peer_chat. */
     uint8_t ann[1024];
     size_t alen = build_announce_frame(&g_chat, nickname, 7, ann, sizeof(ann));
-    if (alen > 0) bc_ble_broadcast(g_chat.ble, ann, alen);
+    if (alen > 0) {
+        sent_queue_push(ann, alen);
+        bc_ble_broadcast(g_chat.ble, ann, alen);
+    }
     uint64_t last_announce = now_ms();
 
     int ble_fd = bc_ble_get_fd(g_chat.ble);
@@ -502,6 +555,7 @@ static int cmd_chat(int use_testnet, const char *adapter,
             uint8_t frame[1024];
             size_t flen = build_message_frame(&g_chat, line, 7, frame, sizeof(frame));
             if (flen > 0) {
+                sent_queue_push(frame, flen);
                 bc_ble_broadcast(g_chat.ble, frame, flen);
                 printf("<me> %s\n", line);
                 fflush(stdout);
@@ -510,8 +564,8 @@ static int cmd_chat(int use_testnet, const char *adapter,
             }
         }
 
-        /* Re-announce every 30s so newly-arrived peers see us. */
-        if (now_ms() - last_announce > 30000) {
+        /* Re-announce every 5s so newly-arrived peers see us quickly. */
+        if (now_ms() - last_announce > 5000) {
             alen = build_announce_frame(&g_chat, nickname, 7, ann, sizeof(ann));
             if (alen > 0) bc_ble_broadcast(g_chat.ble, ann, alen);
             last_announce = now_ms();
