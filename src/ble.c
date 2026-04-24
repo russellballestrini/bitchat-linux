@@ -874,7 +874,13 @@ int bc_ble_broadcast(bc_ble_ctx_t *ctx, const uint8_t *data, size_t len) {
      * then ask sd-bus to emit a canonical PropertiesChanged("Value") signal.
      * BlueZ picks that up and forwards it over BLE as a GATT notification
      * to every subscribed central. Using the raw sd_bus_message_new_signal
-     * path tended to be ignored by BlueZ — this is the supported pattern. */
+     * path tended to be ignored by BlueZ — this is the supported pattern.
+     *
+     * Flush the bus after emit and drain pending signals so rapid back-to-
+     * back broadcasts don't get coalesced: sd-bus only holds one
+     * PropertiesChanged-for-(path,iface) pending at a time, and BlueZ only
+     * sees one signal per flush boundary, so without this loop the replay
+     * queue would collapse to a single delivered frame. */
     memcpy(ctx->current_value, data, len);
     ctx->current_value_len = len;
 
@@ -884,6 +890,7 @@ int bc_ble_broadcast(bc_ble_ctx_t *ctx, const uint8_t *data, size_t len) {
         ble_logf("broadcast emit failed: %s", strerror(-r));
         return r;
     }
+    sd_bus_flush(ctx->bus);
     ble_logf("broadcast %zu bytes (notifying=%d)", len, ctx->notifying);
     return 0;
 }
