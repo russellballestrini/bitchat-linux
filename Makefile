@@ -11,8 +11,8 @@
 
 CC       ?= cc
 CFLAGS   ?= -O2 -g -Wall -Wextra -Wpedantic -std=c11
-CPPFLAGS += -Iinclude -D_POSIX_C_SOURCE=200809L
-LDLIBS   += -lz
+CPPFLAGS += -Iinclude -D_POSIX_C_SOURCE=200809L $(shell pkg-config --cflags libsystemd)
+LDLIBS   += -lz $(shell pkg-config --libs libsystemd)
 
 BIN      := bitchat-linux
 SRCS     := $(wildcard src/*.c)

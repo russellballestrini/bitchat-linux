@@ -1,19 +1,23 @@
 /*
  * bitchat-linux — a C client for the BitChat mesh.
  *
- * Stage 1: decodes BitchatPacket frames. BLE transport lands in Stage 2.
+ * Stage 1: decodes BitchatPacket frames.
+ * Stage 2: BLE receive-only observer via BlueZ (sd-bus).
  *
  * Usage:
  *   bitchat-linux --decode          Read hex on stdin and print decoded packet.
+ *   bitchat-linux --listen          Join the mesh; print each received packet.
  *   bitchat-linux --self-test       Run built-in round-trip tests.
  *
  * This is free and unencumbered software released into the public domain.
  */
 
 #include "announce.h"
+#include "ble.h"
 #include "hex.h"
 #include "packet.h"
 
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -201,11 +205,61 @@ static int self_test(void) {
     return 0;
 }
 
+/* --- listen: BLE mesh observer --- */
+
+static bc_ble_ctx_t *g_ble_ctx = NULL;
+
+static void on_sigint(int sig) { (void)sig; bc_ble_stop(g_ble_ctx); }
+
+static void on_frame(const uint8_t *data, size_t len, const char *peer_path, void *user) {
+    (void)user;
+    bc_packet_t pkt;
+    bc_err_t rc = bc_packet_decode(data, len, &pkt);
+    if (rc != BC_OK) {
+        fprintf(stderr, "[%s] decode failed rc=%d (len=%zu)\n",
+                peer_path ? peer_path : "?", rc, len);
+        return;
+    }
+    printf("--- frame from %s (%zu bytes) ---\n",
+           peer_path ? peer_path : "?", len);
+    print_packet(&pkt);
+    putchar('\n');
+    fflush(stdout);
+    bc_packet_free(&pkt);
+}
+
+static void on_peer(const char *peer_path, const char *event, void *user) {
+    (void)user;
+    fprintf(stderr, "[peer] %s: %s\n", event, peer_path ? peer_path : "?");
+}
+
+static int cmd_listen(int use_testnet) {
+    g_ble_ctx = bc_ble_new(on_frame, on_peer, NULL);
+    if (!g_ble_ctx) { fprintf(stderr, "ble init failed\n"); return 1; }
+
+    signal(SIGINT,  on_sigint);
+    signal(SIGTERM, on_sigint);
+
+    int r = bc_ble_start(g_ble_ctx, use_testnet);
+    if (r < 0) {
+        fprintf(stderr, "ble start failed: %d\n", r);
+        bc_ble_free(g_ble_ctx);
+        return 1;
+    }
+
+    r = bc_ble_run(g_ble_ctx);
+    bc_ble_free(g_ble_ctx);
+    g_ble_ctx = NULL;
+    return r < 0 ? 1 : 0;
+}
+
 static void usage(void) {
     fputs(
-        "bitchat-linux — C client for the BitChat mesh (Stage 1)\n"
+        "bitchat-linux — C client for the BitChat mesh\n"
         "Usage:\n"
         "  bitchat-linux --decode       Decode hex BitchatPacket frame on stdin\n"
+        "  bitchat-linux --listen       Join the mesh and print received packets\n"
+        "  bitchat-linux --listen-test  Listen on the testnet service UUID\n"
         "  bitchat-linux --self-test    Run built-in round-trip tests\n"
         "  bitchat-linux --help         Show this help\n",
         stderr);
@@ -213,8 +267,10 @@ static void usage(void) {
 
 int main(int argc, char **argv) {
     if (argc < 2) { usage(); return 2; }
-    if (strcmp(argv[1], "--decode") == 0)    return cmd_decode();
-    if (strcmp(argv[1], "--self-test") == 0) return self_test();
+    if (strcmp(argv[1], "--decode") == 0)      return cmd_decode();
+    if (strcmp(argv[1], "--listen") == 0)      return cmd_listen(0);
+    if (strcmp(argv[1], "--listen-test") == 0) return cmd_listen(1);
+    if (strcmp(argv[1], "--self-test") == 0)   return self_test();
     if (strcmp(argv[1], "--help") == 0 || strcmp(argv[1], "-h") == 0) {
         usage();
         return 0;

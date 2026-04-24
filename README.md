@@ -11,7 +11,7 @@ use. No internet required. Public domain.
 | Stage | Capability | Status |
 |-------|-----------|--------|
 | 1     | BitchatPacket decode (v1+v2), TLV + announce parser, PKCS#7 padding strip, zlib decompression | **done** |
-| 2     | BLE scan + GATT subscribe via BlueZ (sd-bus). Receive-only mesh observer. | in progress |
+| 2     | BLE scan + GATT subscribe via BlueZ (sd-bus). Receive-only mesh observer. | **done** |
 | 3     | Send announces + public plaintext messages. Relay with TTL. | todo |
 | 4     | Noise XX handshake + encrypted private messages. | todo |
 | 5     | Nostr (NIP-17, geohash channels), Tor, file transfer | todo |
@@ -23,7 +23,7 @@ brings up the radio.
 ## Build
 
 ```sh
-sudo apt install build-essential zlib1g-dev     # Debian/Ubuntu
+sudo apt install build-essential zlib1g-dev libsystemd-dev pkg-config   # Debian/Ubuntu
 make
 make test
 ```
@@ -31,11 +31,30 @@ make test
 ## Use
 
 ```sh
+# Join the mesh (receive-only). Prints every packet received from any peer.
+./bitchat-linux --listen
+
+# Same, but on the testnet service UUID
+./bitchat-linux --listen-test
+
 # Decode a frame from hex (captured via btmon, wireshark, etc.)
 echo "01 01 07 ..." | ./bitchat-linux --decode
 
 # Run built-in round-trip tests
 ./bitchat-linux --self-test
+```
+
+### BLE permissions
+
+BlueZ typically allows unprivileged D-Bus clients to scan and subscribe via
+polkit rules shipped with the distro. If `--listen` complains about access
+on `SetDiscoveryFilter` or `StartDiscovery`, either add yourself to the
+`bluetooth` group or run the binary under `sudo`.
+
+Confirm you have an adapter:
+
+```sh
+bluetoothctl list     # should show at least one controller
 ```
 
 ## Wire format
