@@ -304,6 +304,7 @@ typedef struct {
     const char    *nickname;
     int            use_testnet;
     int            relay;
+    uint64_t       replay_at_ms;   /* 0 = no pending replay */
 } chat_ctx_t;
 
 static chat_ctx_t g_chat;
@@ -463,16 +464,25 @@ static void sigint_handler(int s) {
     if (g_ble_for_signal) bc_ble_stop(g_ble_for_signal);
 }
 
-/* Called by ble.c when a central subscribes (or anything else happens to a
- * peer path). On a new subscription we replay the recent send queue so the
- * peer sees our current presence without having to wait for the next
- * periodic announce. */
+/* Called by ble.c when a central subscribes (or anything else happens to
+ * a peer path). On a new subscription we schedule a delayed replay of
+ * the recent send queue: BlueZ needs ~200ms after StartNotify before
+ * it's fully wired to forward our notifications over the air. Emitting
+ * immediately would race the subscription setup and BlueZ would drop
+ * the frames before the BLE stack acknowledged. */
+#define BC_REPLAY_DELAY_MS 300
+
 static void on_peer_chat(const char *peer_path, const char *event, void *user) {
     chat_ctx_t *c = (chat_ctx_t *)user;
     (void)peer_path;
-    if (strcmp(event, "start-notify") == 0 && c && c->ble) {
-        fprintf(stderr, "[chat] subscriber attached → replaying send queue\n");
-        sent_queue_replay(c->ble);
+    if (!c) return;
+    if (strcmp(event, "start-notify") == 0) {
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        c->replay_at_ms = (uint64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000
+                        + BC_REPLAY_DELAY_MS;
+        fprintf(stderr, "[chat] subscriber attached → replay in %d ms\n",
+                BC_REPLAY_DELAY_MS);
     }
 }
 
@@ -534,13 +544,24 @@ static int cmd_chat(int use_testnet, const char *adapter,
         struct pollfd pfds[2];
         pfds[0].fd = ble_fd;    pfds[0].events = POLLIN;
         pfds[1].fd = STDIN_FILENO; pfds[1].events = POLLIN;
-        int timeout_ms = 1000;
+        int timeout_ms = 100;
         int pr = poll(pfds, 2, timeout_ms);
         if (pr < 0) {
             if (errno == EINTR) continue;
             perror("poll"); break;
         }
         if (pfds[0].revents & POLLIN) bc_ble_process(g_chat.ble);
+
+        /* Fire any pending post-subscribe replay once BlueZ has wired up
+         * its forward path. on_peer_chat arms this on start-notify; the
+         * delay lets BlueZ finish the StartNotify → BLE-forward handshake
+         * before we push frames into the characteristic. */
+        if (g_chat.replay_at_ms && now_ms() >= g_chat.replay_at_ms) {
+            fprintf(stderr, "[chat] replaying send queue (%d frames)\n",
+                    sent_queue_count);
+            sent_queue_replay(g_chat.ble);
+            g_chat.replay_at_ms = 0;
+        }
 
         if (pfds[1].revents & (POLLIN | POLLHUP)) {
             if (fgets(line, sizeof(line), stdin) == NULL) {
