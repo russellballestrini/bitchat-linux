@@ -14,13 +14,21 @@
 
 #include "announce.h"
 #include "ble.h"
+#include "dedup.h"
+#include "encoder.h"
 #include "hex.h"
+#include "identity.h"
 #include "packet.h"
 
+#include <errno.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/time.h>
+#include <time.h>
+#include <unistd.h>
 
 #define MAX_FRAME_BYTES (256u * 1024u)
 
@@ -287,36 +295,332 @@ static int cmd_listen_stream(void) {
     return 0;
 }
 
+/* --- chat + announce: dual-role mesh participation --- */
+
+typedef struct {
+    bc_identity_t  id;
+    bc_dedup_t    *dedup;
+    bc_ble_ctx_t  *ble;
+    int            use_testnet;
+    int            relay;
+} chat_ctx_t;
+
+static chat_ctx_t g_chat;
+
+static uint64_t now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (uint64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+static size_t build_announce_frame(chat_ctx_t *c, const char *nickname,
+                                   uint8_t ttl, uint8_t *out, size_t cap) {
+    /* AnnouncementPacket TLV: nickname(0x01), noise_pk(0x02), signing_pk(0x03) */
+    uint8_t tlv[256];
+    size_t nicklen = strlen(nickname);
+    if (nicklen > 200) nicklen = 200;
+    size_t off = 0;
+    tlv[off++] = 0x01; tlv[off++] = (uint8_t)nicklen;
+    memcpy(tlv + off, nickname, nicklen); off += nicklen;
+    tlv[off++] = 0x02; tlv[off++] = 32;
+    memcpy(tlv + off, c->id.noise_pk, 32); off += 32;
+    tlv[off++] = 0x03; tlv[off++] = 32;
+    memcpy(tlv + off, c->id.signing_pk, 32); off += 32;
+
+    bc_enc_params_t p = {
+        .version = 1, .type = BC_MSG_ANNOUNCE, .ttl = ttl,
+        .timestamp = now_ms(),
+        .sender_id = c->id.peer_id,
+        .payload = tlv, .payload_len = off,
+    };
+    return bc_enc_encode_and_sign(&p, (const struct bc_identity *)&c->id, out, cap);
+}
+
+static size_t build_message_frame(chat_ctx_t *c, const char *text,
+                                  uint8_t ttl, uint8_t *out, size_t cap) {
+    bc_enc_params_t p = {
+        .version = 1, .type = BC_MSG_MESSAGE, .ttl = ttl,
+        .timestamp = now_ms(),
+        .sender_id = c->id.peer_id,
+        .payload = (const uint8_t *)text, .payload_len = strlen(text),
+    };
+    return bc_enc_encode_and_sign(&p, (const struct bc_identity *)&c->id, out, cap);
+}
+
+/* Inbound frame handler — decode, dedup, display, relay. */
+static void on_frame_chat(const uint8_t *data, size_t len,
+                          const char *peer_path, void *user) {
+    chat_ctx_t *c = (chat_ctx_t *)user;
+    bc_packet_t pkt;
+    if (bc_packet_decode(data, len, &pkt) != BC_OK) return;
+
+    /* Drop our own echoes. */
+    if (memcmp(pkt.sender_id, c->id.peer_id, 8) == 0) {
+        bc_packet_free(&pkt);
+        return;
+    }
+
+    /* Dedup on (sender, timestamp, type). */
+    if (bc_dedup_seen_or_add(c->dedup, pkt.sender_id, pkt.timestamp,
+                             pkt.type, now_ms())) {
+        bc_packet_free(&pkt);
+        return;
+    }
+
+    char sender_hex[17];
+    static const char tab[] = "0123456789abcdef";
+    for (int i = 0; i < 8; i++) {
+        sender_hex[i * 2]     = tab[(pkt.sender_id[i] >> 4) & 0xf];
+        sender_hex[i * 2 + 1] = tab[pkt.sender_id[i] & 0xf];
+    }
+    sender_hex[16] = '\0';
+
+    switch (pkt.type) {
+    case BC_MSG_ANNOUNCE: {
+        bc_announce_t ann;
+        if (bc_announce_decode(pkt.payload, pkt.payload_len, &ann)) {
+            printf("[announce] %s (%s)\n", ann.nickname, sender_hex);
+            fflush(stdout);
+        }
+        break;
+    }
+    case BC_MSG_MESSAGE: {
+        printf("<%s> %.*s\n", sender_hex,
+               (int)pkt.payload_len, pkt.payload);
+        fflush(stdout);
+        break;
+    }
+    case BC_MSG_LEAVE:
+        printf("[leave] %s\n", sender_hex);
+        fflush(stdout);
+        break;
+    default:
+        fprintf(stderr, "[frame] %s type=0x%02x len=%zu from=%s\n",
+                bc_msg_type_name(pkt.type), pkt.type, len,
+                peer_path ? peer_path : "?");
+        break;
+    }
+
+    /* Relay path: unencrypted public messages only. TTL decrement. */
+    if (c->relay && pkt.ttl > 1
+        && (pkt.type == BC_MSG_MESSAGE
+            || pkt.type == BC_MSG_ANNOUNCE
+            || pkt.type == BC_MSG_LEAVE)
+        && !pkt.has_recipient) {
+        /* Rebuild the frame with ttl-1. Cheapest path: mutate ttl byte in
+         * a copy of the original frame — ttl is excluded from the signing
+         * input per BitchatPacket.toBinaryDataForSigning, so the existing
+         * signature stays valid. */
+        uint8_t *copy = (uint8_t *)malloc(len);
+        if (copy) {
+            memcpy(copy, data, len);
+            /* ttl lives at offset 2 regardless of version. */
+            copy[2] = (uint8_t)(pkt.ttl - 1);
+            bc_ble_broadcast(c->ble, copy, len);
+            free(copy);
+        }
+    }
+
+    bc_packet_free(&pkt);
+}
+
+static volatile int g_should_exit = 0;
+static bc_ble_ctx_t *g_ble_for_signal = NULL;
+static void sigint_handler(int s) {
+    (void)s;
+    g_should_exit = 1;
+    if (g_ble_for_signal) bc_ble_stop(g_ble_for_signal);
+}
+
+static int cmd_chat(int use_testnet, const char *adapter,
+                    const char *nickname, int enable_relay) {
+    memset(&g_chat, 0, sizeof(g_chat));
+    g_chat.use_testnet = use_testnet;
+    g_chat.relay = enable_relay;
+
+    if (bc_identity_load_or_generate(NULL, &g_chat.id) != 0) {
+        fprintf(stderr, "identity init failed\n");
+        return 1;
+    }
+    char id_hex[17];
+    bc_identity_peer_id_hex(&g_chat.id, id_hex);
+    fprintf(stderr, "[chat] peer_id=%s  nickname=\"%s\"  relay=%s  net=%s\n",
+            id_hex, nickname, enable_relay ? "on" : "off",
+            use_testnet ? "test" : "main");
+
+    g_chat.dedup = bc_dedup_new();
+    if (!g_chat.dedup) { fprintf(stderr, "dedup alloc\n"); return 1; }
+
+    g_chat.ble = bc_ble_new(on_frame_chat, NULL, &g_chat);
+    if (!g_chat.ble) { fprintf(stderr, "ble_new\n"); return 1; }
+    g_ble_for_signal = g_chat.ble;
+    signal(SIGINT,  sigint_handler);
+    signal(SIGTERM, sigint_handler);
+
+    if (bc_ble_start(g_chat.ble, adapter, use_testnet) != 0) {
+        fprintf(stderr, "ble_start failed\n");
+        return 1;
+    }
+    if (bc_ble_enable_peripheral(g_chat.ble, nickname, use_testnet) != 0) {
+        fprintf(stderr, "peripheral enable failed\n");
+        return 1;
+    }
+
+    /* Announce immediately, then every 30s. */
+    uint8_t ann[1024];
+    size_t alen = build_announce_frame(&g_chat, nickname, 7, ann, sizeof(ann));
+    if (alen > 0) bc_ble_broadcast(g_chat.ble, ann, alen);
+    uint64_t last_announce = now_ms();
+
+    int ble_fd = bc_ble_get_fd(g_chat.ble);
+    char line[512];
+
+    fprintf(stderr, "[chat] type messages, Ctrl-D or Ctrl-C to exit.\n");
+
+    while (!g_should_exit) {
+        struct pollfd pfds[2];
+        pfds[0].fd = ble_fd;    pfds[0].events = POLLIN;
+        pfds[1].fd = STDIN_FILENO; pfds[1].events = POLLIN;
+        int timeout_ms = 1000;
+        int pr = poll(pfds, 2, timeout_ms);
+        if (pr < 0) {
+            if (errno == EINTR) continue;
+            perror("poll"); break;
+        }
+        if (pfds[0].revents & POLLIN) bc_ble_process(g_chat.ble);
+
+        if (pfds[1].revents & (POLLIN | POLLHUP)) {
+            if (fgets(line, sizeof(line), stdin) == NULL) {
+                g_should_exit = 1;
+                break;
+            }
+            /* strip trailing newline */
+            size_t ll = strlen(line);
+            while (ll > 0 && (line[ll-1] == '\n' || line[ll-1] == '\r')) line[--ll] = 0;
+            if (ll == 0) continue;
+
+            uint8_t frame[1024];
+            size_t flen = build_message_frame(&g_chat, line, 7, frame, sizeof(frame));
+            if (flen > 0) {
+                bc_ble_broadcast(g_chat.ble, frame, flen);
+                printf("<me> %s\n", line);
+                fflush(stdout);
+            } else {
+                fprintf(stderr, "[chat] encode failed\n");
+            }
+        }
+
+        /* Re-announce every 30s so newly-arrived peers see us. */
+        if (now_ms() - last_announce > 30000) {
+            alen = build_announce_frame(&g_chat, nickname, 7, ann, sizeof(ann));
+            if (alen > 0) bc_ble_broadcast(g_chat.ble, ann, alen);
+            last_announce = now_ms();
+        }
+    }
+
+    bc_ble_free(g_chat.ble);
+    bc_dedup_free(g_chat.dedup);
+    g_ble_for_signal = NULL;
+    return 0;
+}
+
+static int cmd_announce(int use_testnet, const char *adapter, const char *nickname) {
+    memset(&g_chat, 0, sizeof(g_chat));
+    g_chat.use_testnet = use_testnet;
+
+    if (bc_identity_load_or_generate(NULL, &g_chat.id) != 0) {
+        fprintf(stderr, "identity init failed\n");
+        return 1;
+    }
+    char id_hex[17];
+    bc_identity_peer_id_hex(&g_chat.id, id_hex);
+    fprintf(stderr, "[announce] peer_id=%s  nickname=\"%s\"\n", id_hex, nickname);
+
+    g_chat.ble = bc_ble_new(NULL, NULL, &g_chat);
+    if (!g_chat.ble) { fprintf(stderr, "ble_new\n"); return 1; }
+    if (bc_ble_start(g_chat.ble, adapter, use_testnet) != 0) return 1;
+    if (bc_ble_enable_peripheral(g_chat.ble, nickname, use_testnet) != 0) return 1;
+
+    uint8_t frame[1024];
+    size_t flen = build_announce_frame(&g_chat, nickname, 7, frame, sizeof(frame));
+    if (flen == 0) { fprintf(stderr, "[announce] encode failed\n"); return 1; }
+    bc_ble_broadcast(g_chat.ble, frame, flen);
+
+    /* Keep alive 10s so subscribers can read. */
+    int ble_fd = bc_ble_get_fd(g_chat.ble);
+    uint64_t deadline = now_ms() + 10000;
+    while (now_ms() < deadline) {
+        struct pollfd p = { .fd = ble_fd, .events = POLLIN };
+        poll(&p, 1, 200);
+        bc_ble_process(g_chat.ble);
+    }
+    bc_ble_free(g_chat.ble);
+    return 0;
+}
+
 static void usage(void) {
     fputs(
         "bitchat-linux — C client for the BitChat mesh\n"
         "Usage:\n"
         "  bitchat-linux --decode                       Decode hex BitchatPacket on stdin\n"
-        "  bitchat-linux --listen [--adapter <path>]    Join mainnet mesh via BLE\n"
+        "  bitchat-linux --listen [--adapter <path>]    Join mainnet mesh via BLE (receive-only)\n"
         "  bitchat-linux --listen-test [--adapter ...]  Listen on testnet service UUID\n"
         "  bitchat-linux --listen-stream                Read length-prefixed frames on stdin\n"
         "                                               (software mock for CI / no-BLE boxes)\n"
+        "  bitchat-linux --announce --nick <name>       Send one signed announce and exit\n"
+        "  bitchat-linux --chat --nick <name>           Full dual-role mesh citizen:\n"
+        "                                               scan+subscribe, advertise+serve GATT,\n"
+        "                                               stdin → signed public messages,\n"
+        "                                               inbound → displayed + relayed\n"
         "  bitchat-linux --self-test                    Run built-in round-trip tests\n"
         "  bitchat-linux --help                         Show this help\n"
         "\n"
-        "  --adapter <path>   e.g. /org/bluez/hci1 — pick a specific BlueZ adapter.\n",
+        "  --adapter <path>   e.g. /org/bluez/hci1 — pick a specific BlueZ adapter\n"
+        "  --testnet          Use the testnet service UUID (for --announce / --chat)\n"
+        "  --no-relay         Disable the relay path in --chat (default: on)\n"
+        "\n"
+        "Identity is generated on first run and persisted at\n"
+        "  $XDG_CONFIG_HOME/bitchat-linux/identity.bin  (0600)\n",
         stderr);
 }
 
-/* Parse --adapter from argv starting at index i. Returns path or NULL. */
-static const char *parse_adapter(int argc, char **argv, int i) {
-    if (i + 1 < argc && strcmp(argv[i], "--adapter") == 0) return argv[i + 1];
+/* Scan argv for --adapter / --nick / --testnet / --no-relay anywhere
+ * after the subcommand token. Simple since flag-order-independent. */
+static const char *find_flag_value(int argc, char **argv, const char *flag) {
+    for (int i = 2; i + 1 < argc; i++) {
+        if (strcmp(argv[i], flag) == 0) return argv[i + 1];
+    }
     return NULL;
+}
+static int has_flag(int argc, char **argv, const char *flag) {
+    for (int i = 2; i < argc; i++) if (strcmp(argv[i], flag) == 0) return 1;
+    return 0;
 }
 
 int main(int argc, char **argv) {
     if (argc < 2) { usage(); return 2; }
-    if (strcmp(argv[1], "--decode") == 0)        return cmd_decode();
-    if (strcmp(argv[1], "--listen") == 0)        return cmd_listen(0, parse_adapter(argc, argv, 2));
-    if (strcmp(argv[1], "--listen-test") == 0)   return cmd_listen(1, parse_adapter(argc, argv, 2));
-    if (strcmp(argv[1], "--listen-stream") == 0) return cmd_listen_stream();
-    if (strcmp(argv[1], "--self-test") == 0)     return self_test();
-    if (strcmp(argv[1], "--help") == 0 || strcmp(argv[1], "-h") == 0) {
+    const char *sub = argv[1];
+
+    if (strcmp(sub, "--decode") == 0)        return cmd_decode();
+    if (strcmp(sub, "--listen") == 0)        return cmd_listen(0, find_flag_value(argc, argv, "--adapter"));
+    if (strcmp(sub, "--listen-test") == 0)   return cmd_listen(1, find_flag_value(argc, argv, "--adapter"));
+    if (strcmp(sub, "--listen-stream") == 0) return cmd_listen_stream();
+    if (strcmp(sub, "--self-test") == 0)     return self_test();
+
+    if (strcmp(sub, "--announce") == 0 || strcmp(sub, "--chat") == 0) {
+        const char *nick = find_flag_value(argc, argv, "--nick");
+        if (!nick) nick = getenv("USER");
+        if (!nick) nick = "linux";
+        const char *adapter = find_flag_value(argc, argv, "--adapter");
+        int testnet = has_flag(argc, argv, "--testnet");
+        if (strcmp(sub, "--announce") == 0) {
+            return cmd_announce(testnet, adapter, nick);
+        }
+        int relay = !has_flag(argc, argv, "--no-relay");
+        return cmd_chat(testnet, adapter, nick, relay);
+    }
+
+    if (strcmp(sub, "--help") == 0 || strcmp(sub, "-h") == 0) {
         usage();
         return 0;
     }

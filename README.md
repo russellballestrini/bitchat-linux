@@ -12,18 +12,19 @@ use. No internet required. Public domain.
 |-------|-----------|--------|
 | 1     | BitchatPacket decode (v1+v2), TLV + announce parser, PKCS#7 padding strip, zlib decompression | **done** |
 | 2     | BLE scan + GATT subscribe via BlueZ (sd-bus). Receive-only mesh observer. | **done** |
-| 3     | Send announces + public plaintext messages. Relay with TTL. | todo |
+| 3     | Persistent Ed25519 + Curve25519 identity, signed announces + public messages, BLE peripheral (GATT server + LE advertisement), dual-role dispatch, TTL-decrement relay, interactive chat | **done** |
 | 4     | Noise XX handshake + encrypted private messages. | todo |
 | 5     | Nostr (NIP-17, geohash channels), Tor, file transfer | todo |
 
-Stage 1 compiles clean, passes its built-in self-test, and decodes
-captured mesh frames. It does **not** yet join the mesh on its own — Stage 2
-brings up the radio.
+A single bitchat-linux process is now a full mesh citizen: it scans and
+subscribes as a central, advertises and serves GATT as a peripheral,
+signs every outbound public frame with its Ed25519 key, and relays public
+traffic with TTL decrement + a 5-minute dedup cache.
 
 ## Build
 
 ```sh
-sudo apt install build-essential zlib1g-dev libsystemd-dev pkg-config   # Debian/Ubuntu
+sudo apt install build-essential zlib1g-dev libsystemd-dev libssl-dev pkg-config
 make
 make test
 ```
@@ -90,17 +91,26 @@ On single-adapter boxes the test prints a skip message and returns exit 0
 ## Use
 
 ```sh
-# Join the mesh (receive-only). Prints every packet received from any peer.
-./bitchat-linux --listen
+# Full mesh participation: scan + subscribe, advertise + serve GATT,
+# send stdin lines as signed public messages, relay what you hear.
+./bitchat-linux --chat --nick fox
 
-# Same, but on the testnet service UUID
+# Same, but on the testnet service UUID (safe for local testing —
+# doesn't collide with real BitChat peers running on mainnet).
+./bitchat-linux --chat --nick fox --testnet
+
+# One-shot announce (useful for testing discovery between two boxes).
+./bitchat-linux --announce --nick fox --testnet
+
+# Receive-only observer — no identity, no sending, just print what
+# crosses the air.
+./bitchat-linux --listen
 ./bitchat-linux --listen-test
 
-# Pick a specific BlueZ adapter (default: first found)
-./bitchat-linux --listen --adapter /org/bluez/hci1
+# Pick a specific BlueZ adapter (default: first found).
+./bitchat-linux --chat --nick fox --adapter /org/bluez/hci1
 
-# Software mock — read length-prefixed frames on stdin. Runs anywhere,
-# no BLE needed. Same dispatch path as --listen, minus the radio.
+# Software mock — read length-prefixed frames on stdin. No BLE needed.
 ./bitchat-linux --listen-stream < captured_frames.bin
 
 # Decode a frame from hex (captured via btmon, wireshark, etc.)
@@ -109,6 +119,37 @@ echo "01 01 07 ..." | ./bitchat-linux --decode
 # Run built-in round-trip tests
 ./bitchat-linux --self-test
 ```
+
+### Two-node test over real BLE
+
+On two Linux boxes within BLE range (laptops with built-in BT, or USB
+dongles):
+
+```sh
+# Both boxes — fresh identity generated on first run
+./bitchat-linux --chat --nick alice --testnet
+
+# (on the other box)
+./bitchat-linux --chat --nick bob --testnet
+```
+
+Each side will log `[ble] peripheral enabled` + `[ble] discovering`,
+then `[announce] <nickname> (<peer-id>)` when it sees the other. Typing
+a line on one side prints `<me> hello` locally and `<peer-id> hello` on
+the other.
+
+### Identity
+
+Generated on first run and persisted at `0600`:
+
+```
+$XDG_CONFIG_HOME/bitchat-linux/identity.bin
+(or  ~/.config/bitchat-linux/identity.bin)
+```
+
+Contains a 32-byte Ed25519 seed (signing), a 32-byte Curve25519 private
+key (noise static), and their public counterparts. Peer ID is derived
+as `SHA256(noise_pubkey)[0..8]` — matches `BLEService.swift:2894`.
 
 ### BLE permissions
 

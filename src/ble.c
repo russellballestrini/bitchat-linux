@@ -37,8 +37,18 @@
 #define DEVICE_IFACE      "org.bluez.Device1"
 #define GATT_SERVICE_IFACE "org.bluez.GattService1"
 #define GATT_CHAR_IFACE   "org.bluez.GattCharacteristic1"
+#define GATT_MANAGER_IFACE "org.bluez.GattManager1"
+#define LE_ADV_MANAGER_IFACE "org.bluez.LEAdvertisingManager1"
+#define LE_ADV_IFACE      "org.bluez.LEAdvertisement1"
 #define OBJ_MGR_IFACE     "org.freedesktop.DBus.ObjectManager"
 #define PROPS_IFACE       "org.freedesktop.DBus.Properties"
+
+#define APP_PATH    "/bitchat_linux/app"
+#define SVC_PATH    APP_PATH "/service0"
+#define CHAR_PATH   SVC_PATH "/char0"
+#define ADV_PATH    "/bitchat_linux/adv0"
+
+#define BC_MAX_BROADCAST_BYTES 1024
 
 struct bc_ble_ctx {
     sd_bus           *bus;
@@ -52,6 +62,18 @@ struct bc_ble_ctx {
     sd_bus_slot *slot_added;
     sd_bus_slot *slot_removed;
     sd_bus_slot *slot_props;
+
+    /* Peripheral role state */
+    int          peripheral_enabled;
+    char        *local_name;
+    int          use_testnet;
+    uint8_t      current_value[BC_MAX_BROADCAST_BYTES];
+    size_t       current_value_len;
+    int          notifying;
+    sd_bus_slot *slot_om;
+    sd_bus_slot *slot_svc;
+    sd_bus_slot *slot_chrc;
+    sd_bus_slot *slot_adv;
 };
 
 /* ---------- logging ---------- */
@@ -465,6 +487,284 @@ done:
     return ctx->adapter_path ? 0 : -ENODEV;
 }
 
+/* ---------- peripheral role (GATT server + LE advertisement) ----------
+ *
+ * BlueZ asks for our service tree via ObjectManager.GetManagedObjects on
+ * the application root (we register one via sd_bus_add_object_manager),
+ * then inspects the child Service/Characteristic vtables we publish. On
+ * inbound data a central calls WriteValue on our char vtable; we dispatch
+ * those bytes into the same frame callback the central role uses.
+ */
+
+/* --- property getters for GattService1 --- */
+static int prop_svc_uuid(sd_bus *b, const char *path, const char *iface,
+                         const char *prop, sd_bus_message *reply,
+                         void *ud, sd_bus_error *err) {
+    (void)b; (void)path; (void)iface; (void)prop; (void)err;
+    bc_ble_ctx_t *ctx = (bc_ble_ctx_t *)ud;
+    return sd_bus_message_append_basic(reply, 's', ctx->service_uuid);
+}
+static int prop_svc_primary(sd_bus *b, const char *path, const char *iface,
+                            const char *prop, sd_bus_message *reply,
+                            void *ud, sd_bus_error *err) {
+    (void)b; (void)path; (void)iface; (void)prop; (void)ud; (void)err;
+    int yes = 1;
+    return sd_bus_message_append_basic(reply, 'b', &yes);
+}
+
+/* --- property getters for GattCharacteristic1 --- */
+static int prop_chrc_uuid(sd_bus *b, const char *path, const char *iface,
+                          const char *prop, sd_bus_message *reply,
+                          void *ud, sd_bus_error *err) {
+    (void)b; (void)path; (void)iface; (void)prop; (void)ud; (void)err;
+    return sd_bus_message_append_basic(reply, 's', BC_BLE_CHARACTERISTIC_UUID);
+}
+static int prop_chrc_service(sd_bus *b, const char *path, const char *iface,
+                             const char *prop, sd_bus_message *reply,
+                             void *ud, sd_bus_error *err) {
+    (void)b; (void)path; (void)iface; (void)prop; (void)ud; (void)err;
+    return sd_bus_message_append_basic(reply, 'o', SVC_PATH);
+}
+static int prop_chrc_flags(sd_bus *b, const char *path, const char *iface,
+                           const char *prop, sd_bus_message *reply,
+                           void *ud, sd_bus_error *err) {
+    (void)b; (void)path; (void)iface; (void)prop; (void)ud; (void)err;
+    const char *flags[] = { "notify", "read", "write", "write-without-response", NULL };
+    return sd_bus_message_append_strv(reply, (char **)flags);
+}
+static int prop_chrc_notifying(sd_bus *b, const char *path, const char *iface,
+                               const char *prop, sd_bus_message *reply,
+                               void *ud, sd_bus_error *err) {
+    (void)b; (void)path; (void)iface; (void)prop; (void)err;
+    bc_ble_ctx_t *ctx = (bc_ble_ctx_t *)ud;
+    return sd_bus_message_append_basic(reply, 'b', &ctx->notifying);
+}
+static int prop_chrc_value(sd_bus *b, const char *path, const char *iface,
+                           const char *prop, sd_bus_message *reply,
+                           void *ud, sd_bus_error *err) {
+    (void)b; (void)path; (void)iface; (void)prop; (void)err;
+    bc_ble_ctx_t *ctx = (bc_ble_ctx_t *)ud;
+    return sd_bus_message_append_array(reply, 'y', ctx->current_value, ctx->current_value_len);
+}
+
+/* --- characteristic methods --- */
+static int method_chrc_read(sd_bus_message *m, void *ud, sd_bus_error *err) {
+    (void)err;
+    bc_ble_ctx_t *ctx = (bc_ble_ctx_t *)ud;
+    sd_bus_message_skip(m, "a{sv}");
+    sd_bus_message *reply = NULL;
+    int r = sd_bus_message_new_method_return(m, &reply);
+    if (r < 0) return r;
+    r = sd_bus_message_append_array(reply, 'y', ctx->current_value, ctx->current_value_len);
+    if (r < 0) { sd_bus_message_unref(reply); return r; }
+    r = sd_bus_send(sd_bus_message_get_bus(m), reply, NULL);
+    sd_bus_message_unref(reply);
+    return r;
+}
+static int method_chrc_write(sd_bus_message *m, void *ud, sd_bus_error *err) {
+    (void)err;
+    bc_ble_ctx_t *ctx = (bc_ble_ctx_t *)ud;
+    const void *data = NULL;
+    size_t len = 0;
+    int r = sd_bus_message_read_array(m, 'y', &data, &len);
+    if (r < 0) return sd_bus_reply_method_errno(m, EINVAL, NULL);
+    /* skip options dict */
+    sd_bus_message_skip(m, "a{sv}");
+    if (ctx->frame_cb && len > 0) {
+        ctx->frame_cb((const uint8_t *)data, len, "central-write", ctx->user);
+    }
+    return sd_bus_reply_method_return(m, NULL);
+}
+static int method_chrc_start_notify(sd_bus_message *m, void *ud, sd_bus_error *err) {
+    (void)err;
+    bc_ble_ctx_t *ctx = (bc_ble_ctx_t *)ud;
+    if (!ctx->notifying) {
+        ctx->notifying = 1;
+        ble_logf("peripheral: StartNotify (subscriber attached)");
+        if (ctx->peer_cb) ctx->peer_cb("local-subscriber", "start-notify", ctx->user);
+    }
+    return sd_bus_reply_method_return(m, NULL);
+}
+static int method_chrc_stop_notify(sd_bus_message *m, void *ud, sd_bus_error *err) {
+    (void)err;
+    bc_ble_ctx_t *ctx = (bc_ble_ctx_t *)ud;
+    if (ctx->notifying) {
+        ctx->notifying = 0;
+        ble_logf("peripheral: StopNotify");
+        if (ctx->peer_cb) ctx->peer_cb("local-subscriber", "stop-notify", ctx->user);
+    }
+    return sd_bus_reply_method_return(m, NULL);
+}
+
+/* --- advertisement vtable --- */
+static int prop_adv_type(sd_bus *b, const char *path, const char *iface,
+                         const char *prop, sd_bus_message *reply,
+                         void *ud, sd_bus_error *err) {
+    (void)b; (void)path; (void)iface; (void)prop; (void)ud; (void)err;
+    return sd_bus_message_append_basic(reply, 's', "peripheral");
+}
+static int prop_adv_service_uuids(sd_bus *b, const char *path, const char *iface,
+                                  const char *prop, sd_bus_message *reply,
+                                  void *ud, sd_bus_error *err) {
+    (void)b; (void)path; (void)iface; (void)prop; (void)err;
+    bc_ble_ctx_t *ctx = (bc_ble_ctx_t *)ud;
+    const char *uuids[] = { ctx->service_uuid, NULL };
+    return sd_bus_message_append_strv(reply, (char **)uuids);
+}
+static int prop_adv_local_name(sd_bus *b, const char *path, const char *iface,
+                               const char *prop, sd_bus_message *reply,
+                               void *ud, sd_bus_error *err) {
+    (void)b; (void)path; (void)iface; (void)prop; (void)err;
+    bc_ble_ctx_t *ctx = (bc_ble_ctx_t *)ud;
+    const char *name = ctx->local_name ? ctx->local_name : "bitchat-linux";
+    return sd_bus_message_append_basic(reply, 's', name);
+}
+static int prop_adv_includes(sd_bus *b, const char *path, const char *iface,
+                             const char *prop, sd_bus_message *reply,
+                             void *ud, sd_bus_error *err) {
+    (void)b; (void)path; (void)iface; (void)prop; (void)ud; (void)err;
+    const char *empty[] = { NULL };
+    return sd_bus_message_append_strv(reply, (char **)empty);
+}
+static int method_adv_release(sd_bus_message *m, void *ud, sd_bus_error *err) {
+    (void)ud; (void)err;
+    ble_logf("peripheral: advertisement Release from BlueZ");
+    return sd_bus_reply_method_return(m, NULL);
+}
+
+/* --- vtables --- */
+static const sd_bus_vtable svc_vtable[] = {
+    SD_BUS_VTABLE_START(0),
+    SD_BUS_PROPERTY("UUID",    "s", prop_svc_uuid,    0, SD_BUS_VTABLE_PROPERTY_CONST),
+    SD_BUS_PROPERTY("Primary", "b", prop_svc_primary, 0, SD_BUS_VTABLE_PROPERTY_CONST),
+    SD_BUS_VTABLE_END
+};
+
+static const sd_bus_vtable chrc_vtable[] = {
+    SD_BUS_VTABLE_START(0),
+    SD_BUS_PROPERTY("UUID",      "s",  prop_chrc_uuid,      0, SD_BUS_VTABLE_PROPERTY_CONST),
+    SD_BUS_PROPERTY("Service",   "o",  prop_chrc_service,   0, SD_BUS_VTABLE_PROPERTY_CONST),
+    SD_BUS_PROPERTY("Flags",     "as", prop_chrc_flags,     0, SD_BUS_VTABLE_PROPERTY_CONST),
+    SD_BUS_PROPERTY("Notifying", "b",  prop_chrc_notifying, 0, SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
+    SD_BUS_PROPERTY("Value",     "ay", prop_chrc_value,     0, SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
+    SD_BUS_METHOD("ReadValue",   "a{sv}",  "ay", method_chrc_read,         0),
+    SD_BUS_METHOD("WriteValue",  "aya{sv}", "", method_chrc_write,         0),
+    SD_BUS_METHOD("StartNotify", "",        "", method_chrc_start_notify,  0),
+    SD_BUS_METHOD("StopNotify",  "",        "", method_chrc_stop_notify,   0),
+    SD_BUS_VTABLE_END
+};
+
+static const sd_bus_vtable adv_vtable[] = {
+    SD_BUS_VTABLE_START(0),
+    SD_BUS_PROPERTY("Type",         "s",  prop_adv_type,          0, SD_BUS_VTABLE_PROPERTY_CONST),
+    SD_BUS_PROPERTY("ServiceUUIDs", "as", prop_adv_service_uuids, 0, SD_BUS_VTABLE_PROPERTY_CONST),
+    SD_BUS_PROPERTY("LocalName",    "s",  prop_adv_local_name,    0, SD_BUS_VTABLE_PROPERTY_CONST),
+    SD_BUS_PROPERTY("Includes",     "as", prop_adv_includes,      0, SD_BUS_VTABLE_PROPERTY_CONST),
+    SD_BUS_METHOD("Release", "", "", method_adv_release, 0),
+    SD_BUS_VTABLE_END
+};
+
+int bc_ble_enable_peripheral(bc_ble_ctx_t *ctx,
+                             const char *local_name,
+                             int use_testnet) {
+    if (!ctx || !ctx->bus || !ctx->adapter_path) return -EINVAL;
+    if (ctx->peripheral_enabled) return 0;
+
+    ctx->use_testnet = use_testnet;
+    if (!ctx->service_uuid) {
+        ctx->service_uuid = use_testnet ? BC_BLE_SERVICE_UUID_TEST : BC_BLE_SERVICE_UUID;
+    }
+    if (local_name) {
+        free(ctx->local_name);
+        ctx->local_name = strdup(local_name);
+    }
+
+    int r = sd_bus_add_object_manager(ctx->bus, &ctx->slot_om, APP_PATH);
+    if (r < 0) { ble_logf("add_object_manager: %s", strerror(-r)); return r; }
+    ble_logf("  registered ObjectManager at %s", APP_PATH);
+
+    r = sd_bus_add_object_vtable(ctx->bus, &ctx->slot_svc, SVC_PATH,
+                                 GATT_SERVICE_IFACE, svc_vtable, ctx);
+    if (r < 0) { ble_logf("add svc vtable: %s", strerror(-r)); return r; }
+
+    r = sd_bus_add_object_vtable(ctx->bus, &ctx->slot_chrc, CHAR_PATH,
+                                 GATT_CHAR_IFACE, chrc_vtable, ctx);
+    if (r < 0) { ble_logf("add chrc vtable: %s", strerror(-r)); return r; }
+
+    r = sd_bus_add_object_vtable(ctx->bus, &ctx->slot_adv, ADV_PATH,
+                                 LE_ADV_IFACE, adv_vtable, ctx);
+    if (r < 0) { ble_logf("add adv vtable: %s", strerror(-r)); return r; }
+    ble_logf("  vtables installed (svc, chrc, adv)");
+
+    /* Register GATT application — must be async because BlueZ calls back
+     * into our ObjectManager.GetManagedObjects before replying, and a
+     * synchronous sd_bus_call_method would deadlock with our own vtable
+     * dispatch on the same bus. */
+    ble_logf("  dispatching RegisterApplication on %s", ctx->adapter_path);
+    r = sd_bus_call_method_async(ctx->bus, NULL, BLUEZ_DEST, ctx->adapter_path,
+                                 GATT_MANAGER_IFACE, "RegisterApplication",
+                                 NULL, NULL, "oa{sv}", APP_PATH, 0);
+    if (r < 0) {
+        ble_logf("RegisterApplication async dispatch: %s", strerror(-r));
+        return r;
+    }
+
+    ble_logf("  dispatching RegisterAdvertisement");
+    r = sd_bus_call_method_async(ctx->bus, NULL, BLUEZ_DEST, ctx->adapter_path,
+                                 LE_ADV_MANAGER_IFACE, "RegisterAdvertisement",
+                                 NULL, NULL, "oa{sv}", ADV_PATH, 0);
+    if (r < 0) {
+        ble_logf("RegisterAdvertisement async dispatch: %s", strerror(-r));
+        return r;
+    }
+
+    ctx->peripheral_enabled = 1;
+    ble_logf("peripheral enabled (service %s, name \"%s\")",
+             ctx->service_uuid, ctx->local_name ? ctx->local_name : "bitchat-linux");
+    return 0;
+}
+
+int bc_ble_broadcast(bc_ble_ctx_t *ctx, const uint8_t *data, size_t len) {
+    if (!ctx || !data || len == 0) return -EINVAL;
+    if (!ctx->peripheral_enabled) return 0;
+    if (len > sizeof(ctx->current_value)) return -E2BIG;
+
+    /* Stash the frame so any later ReadValue returns something meaningful. */
+    memcpy(ctx->current_value, data, len);
+    ctx->current_value_len = len;
+
+    /* Emit PropertiesChanged on the characteristic with the new Value. */
+    sd_bus_message *m = NULL;
+    int r = sd_bus_message_new_signal(ctx->bus, &m, CHAR_PATH,
+                                      PROPS_IFACE, "PropertiesChanged");
+    if (r < 0) return r;
+    r = sd_bus_message_append_basic(m, 's', GATT_CHAR_IFACE);
+    if (r < 0) goto done;
+    r = sd_bus_message_open_container(m, 'a', "{sv}");
+    if (r < 0) goto done;
+    r = sd_bus_message_open_container(m, 'e', "sv");
+    if (r < 0) goto done;
+    r = sd_bus_message_append_basic(m, 's', "Value");
+    if (r < 0) goto done;
+    r = sd_bus_message_open_container(m, 'v', "ay");
+    if (r < 0) goto done;
+    r = sd_bus_message_append_array(m, 'y', data, len);
+    if (r < 0) goto done;
+    r = sd_bus_message_close_container(m);   /* close v */
+    if (r < 0) goto done;
+    r = sd_bus_message_close_container(m);   /* close e */
+    if (r < 0) goto done;
+    r = sd_bus_message_close_container(m);   /* close a */
+    if (r < 0) goto done;
+    r = sd_bus_message_append(m, "as", 0);   /* empty invalidated array */
+    if (r < 0) goto done;
+    r = sd_bus_send(ctx->bus, m, NULL);
+done:
+    sd_bus_message_unref(m);
+    if (r < 0) ble_logf("broadcast emit failed: %s", strerror(-r));
+    return r < 0 ? r : 0;
+}
+
 /* ---------- public API ---------- */
 
 bc_ble_ctx_t *bc_ble_new(bc_ble_frame_cb_t frame_cb,
@@ -555,8 +855,34 @@ void bc_ble_stop(bc_ble_ctx_t *ctx) {
     if (ctx) ctx->running = 0;
 }
 
+int bc_ble_get_fd(bc_ble_ctx_t *ctx) {
+    return (ctx && ctx->bus) ? sd_bus_get_fd(ctx->bus) : -1;
+}
+
+int bc_ble_process(bc_ble_ctx_t *ctx) {
+    if (!ctx || !ctx->bus) return -EINVAL;
+    int r;
+    do {
+        r = sd_bus_process(ctx->bus, NULL);
+        if (r < 0) return r;
+    } while (r > 0);
+    return 0;
+}
+
 void bc_ble_free(bc_ble_ctx_t *ctx) {
     if (!ctx) return;
+    if (ctx->adapter_path && ctx->peripheral_enabled) {
+        sd_bus_error err = SD_BUS_ERROR_NULL;
+        sd_bus_call_method(ctx->bus, BLUEZ_DEST, ctx->adapter_path,
+                           LE_ADV_MANAGER_IFACE, "UnregisterAdvertisement",
+                           &err, NULL, "o", ADV_PATH);
+        sd_bus_error_free(&err);
+        memset(&err, 0, sizeof(err));
+        sd_bus_call_method(ctx->bus, BLUEZ_DEST, ctx->adapter_path,
+                           GATT_MANAGER_IFACE, "UnregisterApplication",
+                           &err, NULL, "o", APP_PATH);
+        sd_bus_error_free(&err);
+    }
     if (ctx->adapter_path) {
         sd_bus_error err = SD_BUS_ERROR_NULL;
         sd_bus_call_method(ctx->bus, BLUEZ_DEST, ctx->adapter_path,
@@ -567,7 +893,12 @@ void bc_ble_free(bc_ble_ctx_t *ctx) {
     sd_bus_slot_unref(ctx->slot_added);
     sd_bus_slot_unref(ctx->slot_removed);
     sd_bus_slot_unref(ctx->slot_props);
+    sd_bus_slot_unref(ctx->slot_om);
+    sd_bus_slot_unref(ctx->slot_svc);
+    sd_bus_slot_unref(ctx->slot_chrc);
+    sd_bus_slot_unref(ctx->slot_adv);
     if (ctx->bus) sd_bus_unref(ctx->bus);
     free(ctx->adapter_path);
+    free(ctx->local_name);
     free(ctx);
 }

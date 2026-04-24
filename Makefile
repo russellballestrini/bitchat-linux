@@ -12,8 +12,8 @@
 
 CC       ?= cc
 CFLAGS   ?= -O2 -g -Wall -Wextra -Wpedantic -std=c11
-CPPFLAGS += -Iinclude -D_POSIX_C_SOURCE=200809L $(shell pkg-config --cflags libsystemd)
-LDLIBS_CORE := -lz
+CPPFLAGS += -Iinclude -D_POSIX_C_SOURCE=200809L $(shell pkg-config --cflags libsystemd openssl)
+LDLIBS_CORE := -lz $(shell pkg-config --libs openssl)
 LDLIBS_BLE  := $(shell pkg-config --libs libsystemd)
 LDLIBS      := $(LDLIBS_CORE) $(LDLIBS_BLE)
 
@@ -26,7 +26,7 @@ OBJS     := $(SRCS:src/%.c=build/%.o)
 CORE_OBJS := $(filter-out build/main.o build/ble.o, $(OBJS))
 
 # Test helpers compiled into tests/build/
-TEST_SUPPORT := tests/build/encoder.o tests/build/fixtures.o
+TEST_SUPPORT := tests/build/fixtures.o
 TEST_SRCS    := $(wildcard tests/test_*.c)
 TEST_BINS    := $(TEST_SRCS:tests/%.c=tests/build/%)
 FIXTURE_BIN  := tests/build/make_fixture

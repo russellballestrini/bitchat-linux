@@ -59,6 +59,27 @@ int bc_ble_run(bc_ble_ctx_t *ctx);
 /* Signal-safe-ish shutdown: sets a flag; the run loop returns on next tick. */
 void bc_ble_stop(bc_ble_ctx_t *ctx);
 
+/* Event-loop integration — callers that need to poll additional fds (e.g.
+ * stdin for interactive chat) can use these instead of bc_ble_run. */
+int  bc_ble_get_fd(bc_ble_ctx_t *ctx);     /* returns sd_bus fd to poll */
+int  bc_ble_process(bc_ble_ctx_t *ctx);    /* drains pending sd-bus events once */
+
 void bc_ble_free(bc_ble_ctx_t *ctx);
+
+/* ---- Peripheral role (dual-role mesh participation) -------------- */
+
+/* Enable the GATT server + LE advertisement so other centrals (iOS,
+ * macOS, Android, other bitchat-linux) can discover + subscribe to us.
+ * Call after bc_ble_start. local_name is the peripheral name included
+ * in advertisements. use_testnet must match bc_ble_start's choice. */
+int bc_ble_enable_peripheral(bc_ble_ctx_t *ctx,
+                             const char *local_name,
+                             int use_testnet);
+
+/* Broadcast a frame to all currently subscribed centrals by emitting
+ * PropertiesChanged on our GattCharacteristic1's Value property.
+ * Returns 0 on success, <0 on error. Safe to call with peripheral
+ * disabled — it'll no-op. */
+int bc_ble_broadcast(bc_ble_ctx_t *ctx, const uint8_t *data, size_t len);
 
 #endif /* BITCHAT_BLE_H */
