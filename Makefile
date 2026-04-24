@@ -4,6 +4,7 @@
 # Test targets:     unit integration functional functional-mock functional-mesh self-test
 # Setup targets:    deps (auto-detect) deps-apt deps-dnf deps-pacman deps-zypper
 # BlueZ targets:    ble-le-only ble-le-only-restore ble-restart ble-status
+#                   ble-permanent-le ble-permanent-dual ble-permanent-status
 #
 # Runtime deps:
 #   zlib, libsystemd (sd-bus for BlueZ), OpenSSL 3+ (Ed25519 / X25519 / SHA256)
@@ -42,7 +43,8 @@ BINDIR   ?= $(PREFIX)/bin
 
 .PHONY: all clean install test unit integration functional functional-mock functional-mesh self-test \
         deps deps-apt deps-dnf deps-pacman deps-zypper \
-        ble-le-only ble-le-only-restore ble-restart ble-status
+        ble-le-only ble-le-only-restore ble-restart ble-status \
+        ble-permanent-le ble-permanent-dual ble-permanent-status
 
 all: $(BIN)
 
@@ -163,24 +165,59 @@ deps-zypper:
 # BR/EDR leg fails — the link comes up for ~1s then drops with
 # br-connection-canceled / br-connection-key-missing.
 #
-# `ble-le-only` reproduces what iOS/Android do: force the controller
-# into LE-only mode so Connect can't fall through to BR/EDR.
-# `ble-le-only-restore` puts BR/EDR back so headsets etc. work again.
-# Both target hci0 — set HCI=hciN to override.
+# Two ways to fix it:
+#
+#   ble-le-only            — per-session toggle via btmgmt. Forgets on
+#                            every `systemctl restart bluetooth` and
+#                            every reboot, so you'd run it each time.
+#   ble-permanent-le       — flip ControllerMode = le in main.conf.
+#                            Survives reboot. Sudo once, never again.
+#   ble-permanent-dual     — restore ControllerMode = dual (BR/EDR back).
+#   ble-permanent-status   — show the active ControllerMode line.
+#   ble-le-only-restore    — per-session BR/EDR back on (matching pair
+#                            for ble-le-only).
+#   ble-status             — show current adapter settings (LE / BR/EDR).
+#   ble-restart            — just `systemctl restart bluetooth`.
+#
+# Per-session targets default to hci0 — set HCI=hciN to override.
+# Permanent targets default to /etc/bluetooth/main.conf —
+# set BLUEZ_CONF=/path to override.
 HCI ?= 0
+BLUEZ_CONF ?= /etc/bluetooth/main.conf
 
 ble-le-only:
 	sudo systemctl restart bluetooth
 	sudo btmgmt --index $(HCI) power off
 	sudo btmgmt --index $(HCI) bredr off
 	sudo btmgmt --index $(HCI) power on
-	@echo "hci$(HCI) is now LE-only"
+	@echo "hci$(HCI) is now LE-only (per-session — resets on reboot)"
 
 ble-le-only-restore:
 	sudo btmgmt --index $(HCI) power off
 	sudo btmgmt --index $(HCI) bredr on
 	sudo btmgmt --index $(HCI) power on
 	@echo "hci$(HCI) BR/EDR re-enabled"
+
+# Permanent LE-only via /etc/bluetooth/main.conf [General] ControllerMode.
+# Idempotent: strips any existing ControllerMode line (commented or not)
+# and re-inserts directly under [General], so re-running just sets it.
+ble-permanent-le:
+	@grep -q '^\[General\]' $(BLUEZ_CONF) || \
+	    { echo "$(BLUEZ_CONF) has no [General] section"; exit 1; }
+	sudo sed -i '/^[[:space:]]*#\?[[:space:]]*ControllerMode[[:space:]]*=/d' $(BLUEZ_CONF)
+	sudo sed -i '/^\[General\]/a ControllerMode = le' $(BLUEZ_CONF)
+	sudo systemctl restart bluetooth
+	@echo "$(BLUEZ_CONF): ControllerMode = le (survives reboot)"
+
+ble-permanent-dual:
+	sudo sed -i '/^[[:space:]]*#\?[[:space:]]*ControllerMode[[:space:]]*=/d' $(BLUEZ_CONF)
+	sudo sed -i '/^\[General\]/a ControllerMode = dual' $(BLUEZ_CONF)
+	sudo systemctl restart bluetooth
+	@echo "$(BLUEZ_CONF): ControllerMode = dual"
+
+ble-permanent-status:
+	@grep -E '^[[:space:]]*ControllerMode[[:space:]]*=' $(BLUEZ_CONF) \
+	    || echo "$(BLUEZ_CONF): ControllerMode unset (default = dual)"
 
 ble-restart:
 	sudo systemctl restart bluetooth
