@@ -346,6 +346,33 @@ static int on_async_connect_reply(sd_bus_message *m, void *ud, sd_bus_error *e) 
     return 0;
 }
 
+static int on_async_set_reply(sd_bus_message *m, void *ud, sd_bus_error *e) {
+    (void)ud; (void)e;
+    const sd_bus_error *err = sd_bus_message_get_error(m);
+    if (err && err->name) {
+        ble_logf("Set Trusted reply: %s: %s", err->name,
+                 err->message ? err->message : "");
+    }
+    return 0;
+}
+
+/* Flag the peer Trusted before dispatching Connect. On at least BlueZ
+ * 5.72/5.84 Device1.Connect probes BR/EDR alongside LE and on an
+ * unbonded public-address peer returns br-connection-key-missing,
+ * which tears down the LE link that had already come up. Marking the
+ * device Trusted tells BlueZ to skip the bond-gated BR/EDR path, so
+ * the LE link survives the Connect reply. */
+static void device_set_trusted_async(bc_ble_ctx_t *ctx, const char *path) {
+    int trust = 1;
+    int r = sd_bus_call_method_async(ctx->bus, NULL, BLUEZ_DEST, path,
+                                     PROPS_IFACE, "Set",
+                                     on_async_set_reply, NULL,
+                                     "ssv", DEVICE_IFACE, "Trusted", "b",
+                                     trust);
+    if (r < 0) ble_logf("Set Trusted(%s) dispatch failed: %s",
+                        path, strerror(-r));
+}
+
 /* Dispatch Device1.Connect with per-peer rate limiting. Without the
  * cooldown, a flapping link makes us re-issue Connect inside BlueZ's
  * pending window, earning "Operation already in progress" and
@@ -360,6 +387,8 @@ static int device_connect_async(bc_ble_ctx_t *ctx, const char *path) {
         }
         ctx->last_connect_ms[idx] = now;
     }
+
+    device_set_trusted_async(ctx, path);
 
     int r = sd_bus_call_method_async(ctx->bus, NULL, BLUEZ_DEST, path,
                                      DEVICE_IFACE, "Connect",
