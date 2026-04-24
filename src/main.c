@@ -532,6 +532,7 @@ static int cmd_chat(int use_testnet, const char *adapter,
     if (alen > 0) {
         sent_queue_push(ann, alen);
         bc_ble_broadcast(g_chat.ble, ann, alen);
+        bc_ble_central_write(g_chat.ble, ann, alen);
     }
     uint64_t last_announce = now_ms();
 
@@ -581,7 +582,15 @@ static int cmd_chat(int use_testnet, const char *adapter,
             size_t flen = build_message_frame(&g_chat, line, 7, frame, sizeof(frame));
             if (flen > 0) {
                 sent_queue_push(frame, flen);
+                /* Two send paths because in a dual-role mesh either side
+                 * may be central or peripheral on a given connection.
+                 * bc_ble_broadcast covers the peripheral→central direction
+                 * via Notify; bc_ble_central_write covers the
+                 * central→peripheral direction via WriteValue. Whichever
+                 * side won the staggered Connect race uses one; the other
+                 * uses the other. */
                 bc_ble_broadcast(g_chat.ble, frame, flen);
+                bc_ble_central_write(g_chat.ble, frame, flen);
                 printf("<me> %s\n", line);
                 fflush(stdout);
             } else {
@@ -592,7 +601,10 @@ static int cmd_chat(int use_testnet, const char *adapter,
         /* Re-announce every 5s so newly-arrived peers see us quickly. */
         if (now_ms() - last_announce > 5000) {
             alen = build_announce_frame(&g_chat, nickname, 7, ann, sizeof(ann));
-            if (alen > 0) bc_ble_broadcast(g_chat.ble, ann, alen);
+            if (alen > 0) {
+                bc_ble_broadcast(g_chat.ble, ann, alen);
+                bc_ble_central_write(g_chat.ble, ann, alen);
+            }
             last_announce = now_ms();
         }
     }

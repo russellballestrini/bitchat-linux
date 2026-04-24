@@ -83,4 +83,12 @@ int bc_ble_enable_peripheral(bc_ble_ctx_t *ctx,
  * disabled — it'll no-op. */
 int bc_ble_broadcast(bc_ble_ctx_t *ctx, const uint8_t *data, size_t len);
 
+/* Send a frame to every peer to whom we are central — i.e. every peer
+ * whose GATT characteristic we have discovered — by calling WriteValue
+ * on their bitchat characteristic. Mirror of bc_ble_broadcast for the
+ * central direction so dual-role peers can talk both ways regardless of
+ * which side won the Connect race. Returns the number of peers we
+ * dispatched a write to. */
+int bc_ble_central_write(bc_ble_ctx_t *ctx, const uint8_t *data, size_t len);
+
 #endif /* BITCHAT_BLE_H */

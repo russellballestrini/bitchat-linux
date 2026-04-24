@@ -81,6 +81,11 @@ struct bc_ble_ctx {
     char        *matched_peers[BC_MAX_PEERS];
     uint64_t     next_connect_at_ms[BC_MAX_PEERS];
     uint64_t     last_connect_ms[BC_MAX_PEERS];
+    /* Per-peer remote bitchat characteristic path. Set when we discover
+     * the GattCharacteristic1 under a matched peer; cleared on Connected=0
+     * because BlueZ tears the char objects down with the link. Used by
+     * bc_ble_central_write to send messages while we are the central. */
+    char        *matched_char_paths[BC_MAX_PEERS];
     int          matched_peer_count;
 
     /* Peripheral role state */
@@ -307,9 +312,46 @@ static void peer_remember(bc_ble_ctx_t *ctx, const char *path) {
     char *dup = strdup(path);
     if (!dup) return;
     ctx->matched_peers[ctx->matched_peer_count]       = dup;
+    ctx->matched_char_paths[ctx->matched_peer_count]  = NULL;
     ctx->next_connect_at_ms[ctx->matched_peer_count]  = 0;
     ctx->last_connect_ms[ctx->matched_peer_count]     = 0;
     ctx->matched_peer_count++;
+}
+
+/* /org/bluez/hciN/dev_X/serviceY/charZ → /org/bluez/hciN/dev_X
+ * Returns 0 on success. */
+static int dev_path_from_char(const char *char_path, char *out, size_t cap) {
+    if (!char_path) return -1;
+    size_t l = strlen(char_path);
+    if (l + 1 > cap) return -1;
+    memcpy(out, char_path, l + 1);
+    char *cut = strrchr(out, '/');
+    if (!cut) return -1;
+    *cut = 0;
+    cut = strrchr(out, '/');
+    if (!cut) return -1;
+    *cut = 0;
+    return 0;
+}
+
+static void peer_set_char_path(bc_ble_ctx_t *ctx, const char *char_path) {
+    char devpath[256];
+    if (dev_path_from_char(char_path, devpath, sizeof(devpath)) != 0) return;
+    int idx = peer_index(ctx, devpath);
+    if (idx < 0) return;
+    if (ctx->matched_char_paths[idx]
+        && strcmp(ctx->matched_char_paths[idx], char_path) == 0) {
+        return;
+    }
+    free(ctx->matched_char_paths[idx]);
+    ctx->matched_char_paths[idx] = strdup(char_path);
+}
+
+static void peer_clear_char_path(bc_ble_ctx_t *ctx, const char *dev_path) {
+    int idx = peer_index(ctx, dev_path);
+    if (idx < 0) return;
+    free(ctx->matched_char_paths[idx]);
+    ctx->matched_char_paths[idx] = NULL;
 }
 
 /* Random jitter for staggering Connect attempts between two symmetric
@@ -387,6 +429,38 @@ static int char_start_notify_async(bc_ble_ctx_t *ctx, const char *path) {
     return r;
 }
 
+static int on_async_writevalue_reply(sd_bus_message *m, void *ud, sd_bus_error *e) {
+    (void)ud; (void)e;
+    const sd_bus_error *err = sd_bus_message_get_error(m);
+    if (err && err->name) {
+        ble_logf("WriteValue reply: %s: %s", err->name,
+                 err->message ? err->message : "");
+    }
+    return 0;
+}
+
+static int char_write_value_async(bc_ble_ctx_t *ctx, const char *path,
+                                  const uint8_t *data, size_t len) {
+    sd_bus_message *msg = NULL;
+    int r = sd_bus_message_new_method_call(ctx->bus, &msg,
+                                           BLUEZ_DEST, path,
+                                           GATT_CHAR_IFACE, "WriteValue");
+    if (r < 0) return r;
+    r = sd_bus_message_append_array(msg, 'y', data, len);
+    if (r < 0) goto done;
+    r = sd_bus_message_open_container(msg, 'a', "{sv}");
+    if (r < 0) goto done;
+    r = sd_bus_message_close_container(msg);
+    if (r < 0) goto done;
+    r = sd_bus_call_async(ctx->bus, NULL, msg,
+                          on_async_writevalue_reply, NULL, 0);
+    if (r < 0) ble_logf("WriteValue(%s) dispatch failed: %s",
+                        path, strerror(-r));
+done:
+    sd_bus_message_unref(msg);
+    return r;
+}
+
 /* ---------- interface handlers ---------- */
 
 /* Parse one Device1 property dict. Returns 1 if it advertises our service. */
@@ -451,6 +525,7 @@ static void handle_iface_entry(bc_ble_ctx_t *ctx, const char *path,
     } else if (strcmp(iface, GATT_CHAR_IFACE) == 0) {
         if (char_props_match(m, BC_BLE_CHARACTERISTIC_UUID)) {
             ble_logf("char: %s matches, start notify", path);
+            peer_set_char_path(ctx, path);
             if (ctx->peer_cb) ctx->peer_cb(path, "notify-started", ctx->user);
             char_start_notify_async(ctx, path);
         } else {
@@ -540,6 +615,11 @@ static int on_properties_changed(sd_bus_message *m, void *userdata,
                                 if (on) {
                                     cancel_pending_connect(ctx, path);
                                 } else {
+                                    /* BlueZ tears the GATT char objects
+                                     * down with the link; drop the cached
+                                     * write target so we don't dispatch
+                                     * WriteValue against a stale path. */
+                                    peer_clear_char_path(ctx, path);
                                     schedule_connect(ctx, path,
                                                      "reconnect scheduled");
                                 }
@@ -936,6 +1016,21 @@ int bc_ble_broadcast(bc_ble_ctx_t *ctx, const uint8_t *data, size_t len) {
     return 0;
 }
 
+int bc_ble_central_write(bc_ble_ctx_t *ctx, const uint8_t *data, size_t len) {
+    if (!ctx || !data || len == 0) return 0;
+    int sent = 0;
+    for (int i = 0; i < ctx->matched_peer_count; i++) {
+        const char *cpath = ctx->matched_char_paths[i];
+        if (!cpath) continue;
+        if (char_write_value_async(ctx, cpath, data, len) >= 0) sent++;
+    }
+    if (sent > 0) {
+        sd_bus_flush(ctx->bus);
+        ble_logf("central-write %zu bytes to %d peer(s)", len, sent);
+    }
+    return sent;
+}
+
 /* ---------- public API ---------- */
 
 bc_ble_ctx_t *bc_ble_new(bc_ble_frame_cb_t frame_cb,
@@ -1096,7 +1191,10 @@ void bc_ble_free(bc_ble_ctx_t *ctx) {
     sd_bus_slot_unref(ctx->slot_chrc);
     sd_bus_slot_unref(ctx->slot_adv);
     if (ctx->bus) sd_bus_unref(ctx->bus);
-    for (int i = 0; i < ctx->matched_peer_count; i++) free(ctx->matched_peers[i]);
+    for (int i = 0; i < ctx->matched_peer_count; i++) {
+        free(ctx->matched_peers[i]);
+        free(ctx->matched_char_paths[i]);
+    }
     free(ctx->adapter_path);
     free(ctx->local_name);
     free(ctx);
