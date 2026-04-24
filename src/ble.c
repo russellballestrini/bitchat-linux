@@ -49,6 +49,7 @@
 #define ADV_PATH    "/bitchat_linux/adv0"
 
 #define BC_MAX_BROADCAST_BYTES 1024
+#define BC_MAX_PEERS           8
 
 struct bc_ble_ctx {
     sd_bus           *bus;
@@ -62,6 +63,12 @@ struct bc_ble_ctx {
     sd_bus_slot *slot_added;
     sd_bus_slot *slot_removed;
     sd_bus_slot *slot_props;
+
+    /* Remembered peer device paths that advertised our service UUID.
+     * On Connected=0 for a known peer we re-dispatch Connect so the
+     * mesh link comes back up without needing a fresh advertisement. */
+    char        *matched_peers[BC_MAX_PEERS];
+    int          matched_peer_count;
 
     /* Peripheral role state */
     int          peripheral_enabled;
@@ -259,18 +266,54 @@ static int adapter_start_discovery(bc_ble_ctx_t *ctx) {
     return r;
 }
 
+static int peer_known(bc_ble_ctx_t *ctx, const char *path) {
+    if (!path) return 0;
+    for (int i = 0; i < ctx->matched_peer_count; i++) {
+        if (strcmp(ctx->matched_peers[i], path) == 0) return 1;
+    }
+    return 0;
+}
+
+static void peer_remember(bc_ble_ctx_t *ctx, const char *path) {
+    if (!path || peer_known(ctx, path)) return;
+    if (ctx->matched_peer_count >= BC_MAX_PEERS) return;
+    char *dup = strdup(path);
+    if (!dup) return;
+    ctx->matched_peers[ctx->matched_peer_count++] = dup;
+}
+
+static int on_async_connect_reply(sd_bus_message *m, void *ud, sd_bus_error *e) {
+    (void)ud; (void)e;
+    const sd_bus_error *err = sd_bus_message_get_error(m);
+    if (err && err->name) {
+        ble_logf("Connect reply: %s: %s", err->name,
+                 err->message ? err->message : "");
+    }
+    return 0;
+}
+
 static int device_connect_async(bc_ble_ctx_t *ctx, const char *path) {
     int r = sd_bus_call_method_async(ctx->bus, NULL, BLUEZ_DEST, path,
                                      DEVICE_IFACE, "Connect",
-                                     NULL, NULL, NULL);
+                                     on_async_connect_reply, NULL, NULL);
     if (r < 0) ble_logf("Connect(%s) dispatch failed: %s", path, strerror(-r));
     return r;
+}
+
+static int on_async_startnotify_reply(sd_bus_message *m, void *ud, sd_bus_error *e) {
+    (void)ud; (void)e;
+    const sd_bus_error *err = sd_bus_message_get_error(m);
+    if (err && err->name) {
+        ble_logf("StartNotify reply: %s: %s", err->name,
+                 err->message ? err->message : "");
+    }
+    return 0;
 }
 
 static int char_start_notify_async(bc_ble_ctx_t *ctx, const char *path) {
     int r = sd_bus_call_method_async(ctx->bus, NULL, BLUEZ_DEST, path,
                                      GATT_CHAR_IFACE, "StartNotify",
-                                     NULL, NULL, NULL);
+                                     on_async_startnotify_reply, NULL, NULL);
     if (r < 0) ble_logf("StartNotify(%s) dispatch failed: %s", path, strerror(-r));
     return r;
 }
@@ -330,6 +373,7 @@ static void handle_iface_entry(bc_ble_ctx_t *ctx, const char *path,
     if (strcmp(iface, DEVICE_IFACE) == 0) {
         if (device_props_match(m, ctx->service_uuid)) {
             ble_logf("device: %s matches, connecting", path);
+            peer_remember(ctx, path);
             if (ctx->peer_cb) ctx->peer_cb(path, "discover", ctx->user);
             device_connect_async(ctx, path);
         } else {
@@ -416,6 +460,15 @@ static int on_properties_changed(sd_bus_message *m, void *userdata,
                             sd_bus_message_exit_container(m);
                             ble_logf("device %s: Connected=%d",
                                      path ? path : "?", on);
+                            /* BlueZ tears the link down after the initial
+                             * exchange in some dual-role topologies. If this
+                             * is a peer we've matched before, reconnect so
+                             * the chat stream continues instead of stalling
+                             * on notifying=0. */
+                            if (!on && path && peer_known(ctx, path)) {
+                                ble_logf("reconnect: %s → Connect", path);
+                                device_connect_async(ctx, path);
+                            }
                         } else {
                             sd_bus_message_skip(m, "v");
                         }
@@ -934,6 +987,7 @@ void bc_ble_free(bc_ble_ctx_t *ctx) {
     sd_bus_slot_unref(ctx->slot_chrc);
     sd_bus_slot_unref(ctx->slot_adv);
     if (ctx->bus) sd_bus_unref(ctx->bus);
+    for (int i = 0; i < ctx->matched_peer_count; i++) free(ctx->matched_peers[i]);
     free(ctx->adapter_path);
     free(ctx->local_name);
     free(ctx);
