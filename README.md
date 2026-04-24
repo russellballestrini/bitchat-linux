@@ -28,6 +28,33 @@ make
 make test
 ```
 
+## Tests
+
+Three layers, all fully synthetic — no BLE hardware, no real peer required:
+
+```sh
+make unit          # per-module tests (hex, padding, tlv, announce, packet)
+make integration   # multi-module: encoded frame → decoded + TLV extracted
+make functional    # CLI: make_fixture → bitchat-linux --decode → grep
+make test          # all of the above + --self-test
+```
+
+Current coverage:
+
+| Suite | Tests | Focus |
+|-------|-------|-------|
+| `test_hex`         | 7 | hex decode/encode, case mixing, overflow, rejection |
+| `test_padding`     | 6 | PKCS#7 strip edge cases |
+| `test_tlv`         | 5 | TLV iteration, truncation rejection |
+| `test_announce`    | 5 | AnnouncementPacket TLVs, missing-field rejection, neighbors |
+| `test_packet`      | 9 | v1/v2, flags, padding, compression, routing, truncation, fuzz |
+| `test_integration` | 4 | padded+compressed announce end-to-end, UTF-8, noise pass-through, TTL preservation |
+| `functional.sh`    | 10 | CLI against known-good fixtures + error paths |
+
+The fuzz case in `test_packet` feeds 256 random buffers through the decoder
+and asserts no crash — a baseline regression gate for "can't crash on
+bytes from the wire". Swap in AFL++ later for deeper fuzzing.
+
 ## Use
 
 ```sh
