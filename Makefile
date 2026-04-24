@@ -34,7 +34,7 @@ FIXTURE_BIN  := tests/build/make_fixture
 PREFIX   ?= /usr/local
 BINDIR   ?= $(PREFIX)/bin
 
-.PHONY: all clean install test unit integration functional self-test
+.PHONY: all clean install test unit integration functional functional-mock functional-mesh self-test
 
 all: $(BIN)
 
@@ -67,11 +67,26 @@ self-test: $(BIN)
 	./$(BIN) --self-test
 
 functional: $(BIN) $(FIXTURE_BIN)
-	@echo "== functional =="
+	@echo "== functional (CLI) =="
 	tests/functional.sh
 
-test: unit self-test functional
-	@echo "all tests passed"
+# Software mock: canned frames piped through --listen-stream into the
+# real dispatch path. Runs anywhere, no BLE needed.
+functional-mock: $(BIN) $(FIXTURE_BIN)
+	@echo "== functional (mock / no BLE) =="
+	tests/functional_mock.sh
+
+# Real BLE round-trip across two adapters. Skips gracefully (TAP exit 77)
+# if only one adapter is present on this box — converted to make-friendly
+# exit 0 so this target doesn't break `make all` on single-adapter hosts.
+functional-mesh: $(BIN) $(FIXTURE_BIN)
+	@echo "== functional (BLE mesh, needs 2 adapters) =="
+	@tests/functional_mesh.sh; s=$$?; \
+	 if [ "$$s" = 77 ]; then echo "(skipped — insufficient BLE hardware)"; exit 0; \
+	 else exit $$s; fi
+
+test: unit self-test functional functional-mock
+	@echo "all tests passed (mesh test excluded — run 'make functional-mesh' with 2 BLE adapters)"
 
 install: $(BIN)
 	install -D -m 0755 $(BIN) $(DESTDIR)$(BINDIR)/$(BIN)

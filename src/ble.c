@@ -486,8 +486,16 @@ bc_ble_ctx_t *bc_ble_new(bc_ble_frame_cb_t frame_cb,
     return ctx;
 }
 
-int bc_ble_start(bc_ble_ctx_t *ctx, int use_testnet) {
+int bc_ble_start(bc_ble_ctx_t *ctx, const char *adapter_path, int use_testnet) {
     ctx->service_uuid = use_testnet ? BC_BLE_SERVICE_UUID_TEST : BC_BLE_SERVICE_UUID;
+
+    /* If the caller supplied an explicit adapter path, record it now so the
+     * managed-objects walk doesn't overwrite with the first one found. */
+    if (adapter_path && adapter_path[0]) {
+        ctx->adapter_path = strdup(adapter_path);
+        if (!ctx->adapter_path) return -ENOMEM;
+        ble_logf("adapter (explicit): %s", ctx->adapter_path);
+    }
 
     /* Register match rules first so we don't miss InterfacesAdded between
      * scan and StartDiscovery. */

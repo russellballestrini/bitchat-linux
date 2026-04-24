@@ -30,30 +30,62 @@ make test
 
 ## Tests
 
-Three layers, all fully synthetic — no BLE hardware, no real peer required:
+Four layers. The first three run anywhere on Linux — no BLE hardware
+needed. The fourth requires two BlueZ adapters to round-trip over real
+radio; it skips cleanly if you have only one.
 
 ```sh
-make unit          # per-module tests (hex, padding, tlv, announce, packet)
-make integration   # multi-module: encoded frame → decoded + TLV extracted
-make functional    # CLI: make_fixture → bitchat-linux --decode → grep
-make test          # all of the above + --self-test
+make unit              # per-module tests (hex, padding, tlv, announce, packet)
+make integration       # multi-module: encoded frame → decoded + TLV extracted
+make functional        # CLI: make_fixture → bitchat-linux --decode → grep
+make functional-mock   # canned frames → --listen-stream (no BLE, exercises dispatch)
+make test              # unit + self-test + functional + functional-mock
+make functional-mesh   # real BLE round-trip across 2 adapters (skip if only 1)
 ```
 
 Current coverage:
 
-| Suite | Tests | Focus |
-|-------|-------|-------|
-| `test_hex`         | 7 | hex decode/encode, case mixing, overflow, rejection |
-| `test_padding`     | 6 | PKCS#7 strip edge cases |
-| `test_tlv`         | 5 | TLV iteration, truncation rejection |
-| `test_announce`    | 5 | AnnouncementPacket TLVs, missing-field rejection, neighbors |
-| `test_packet`      | 9 | v1/v2, flags, padding, compression, routing, truncation, fuzz |
-| `test_integration` | 4 | padded+compressed announce end-to-end, UTF-8, noise pass-through, TTL preservation |
-| `functional.sh`    | 10 | CLI against known-good fixtures + error paths |
+| Suite                | Tests | BLE? | Focus |
+|----------------------|-------|------|-------|
+| `test_hex`           | 7  | —  | hex decode/encode, case mixing, overflow, rejection |
+| `test_padding`       | 6  | —  | PKCS#7 strip edge cases |
+| `test_tlv`           | 5  | —  | TLV iteration, truncation rejection |
+| `test_announce`      | 5  | —  | AnnouncementPacket TLVs, missing-field rejection, neighbors |
+| `test_packet`        | 9  | —  | v1/v2, flags, padding, compression, routing, truncation, fuzz |
+| `test_integration`   | 4  | —  | padded+compressed announce end-to-end, UTF-8, Noise pass-through, TTL |
+| `functional.sh`      | 10 | —  | CLI against known-good fixtures + error paths |
+| `functional_mock.sh` | 6  | —  | stream-mode dispatch, multi-frame, bogus-length rejection |
+| `functional_mesh.sh` | 6  | 2× | fake_peer advertises → `--listen-test` on 2nd adapter → decode |
 
 The fuzz case in `test_packet` feeds 256 random buffers through the decoder
 and asserts no crash — a baseline regression gate for "can't crash on
 bytes from the wire". Swap in AFL++ later for deeper fuzzing.
+
+### The mesh test — real BLE round-trip
+
+One physical radio cannot scan its own advertisement, so same-adapter
+self-loopback doesn't work at the radio layer. The mesh test therefore
+requires **two adapters**:
+
+- Laptop built-in + USB BLE dongle on one machine, **or**
+- Two machines (e.g., two ThinkPads on the same desk) where one runs
+  `tests/fake_peer.py` and the other runs `./bitchat-linux --listen-test`
+
+```sh
+# single-box with USB dongle
+make functional-mesh
+
+# custom adapter assignment
+PEER_HCI=hci1 LISTEN_HCI=hci0 make functional-mesh
+
+# two machines: on the "peer" box
+python3 tests/fake_peer.py --timeout 60
+# on the "listener" box
+./bitchat-linux --listen-test
+```
+
+On single-adapter boxes the test prints a skip message and returns exit 0
+(via TAP-style exit-77 convention) so `make all` still passes in CI.
 
 ## Use
 
@@ -63,6 +95,13 @@ bytes from the wire". Swap in AFL++ later for deeper fuzzing.
 
 # Same, but on the testnet service UUID
 ./bitchat-linux --listen-test
+
+# Pick a specific BlueZ adapter (default: first found)
+./bitchat-linux --listen --adapter /org/bluez/hci1
+
+# Software mock — read length-prefixed frames on stdin. Runs anywhere,
+# no BLE needed. Same dispatch path as --listen, minus the radio.
+./bitchat-linux --listen-stream < captured_frames.bin
 
 # Decode a frame from hex (captured via btmon, wireshark, etc.)
 echo "01 01 07 ..." | ./bitchat-linux --decode

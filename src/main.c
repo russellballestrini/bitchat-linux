@@ -233,14 +233,14 @@ static void on_peer(const char *peer_path, const char *event, void *user) {
     fprintf(stderr, "[peer] %s: %s\n", event, peer_path ? peer_path : "?");
 }
 
-static int cmd_listen(int use_testnet) {
+static int cmd_listen(int use_testnet, const char *adapter) {
     g_ble_ctx = bc_ble_new(on_frame, on_peer, NULL);
     if (!g_ble_ctx) { fprintf(stderr, "ble init failed\n"); return 1; }
 
     signal(SIGINT,  on_sigint);
     signal(SIGTERM, on_sigint);
 
-    int r = bc_ble_start(g_ble_ctx, use_testnet);
+    int r = bc_ble_start(g_ble_ctx, adapter, use_testnet);
     if (r < 0) {
         fprintf(stderr, "ble start failed: %d\n", r);
         bc_ble_free(g_ble_ctx);
@@ -253,24 +253,69 @@ static int cmd_listen(int use_testnet) {
     return r < 0 ? 1 : 0;
 }
 
+/* --- listen-stream: software mock, reads length-prefixed frames from stdin --- */
+
+static int cmd_listen_stream(void) {
+    /* Each frame on stdin is a 4-byte big-endian length followed by that
+     * many bytes of BitchatPacket. Lets tests feed BLE-shaped data into
+     * the same on_frame dispatch path that the sd-bus transport uses,
+     * without touching a radio. */
+    for (;;) {
+        uint8_t lenbuf[4];
+        size_t got = fread(lenbuf, 1, 4, stdin);
+        if (got == 0) break;
+        if (got != 4) {
+            fprintf(stderr, "[stream] short length header (%zu bytes)\n", got);
+            return 1;
+        }
+        uint32_t len = ((uint32_t)lenbuf[0] << 24) | ((uint32_t)lenbuf[1] << 16)
+                     | ((uint32_t)lenbuf[2] <<  8) |  (uint32_t)lenbuf[3];
+        if (len == 0 || len > MAX_FRAME_BYTES) {
+            fprintf(stderr, "[stream] bogus frame length %u\n", len);
+            return 1;
+        }
+        uint8_t *buf = (uint8_t *)malloc(len);
+        if (!buf) { fprintf(stderr, "[stream] oom\n"); return 1; }
+        if (fread(buf, 1, len, stdin) != len) {
+            fprintf(stderr, "[stream] short frame body\n");
+            free(buf);
+            return 1;
+        }
+        on_frame(buf, len, "stream", NULL);
+        free(buf);
+    }
+    return 0;
+}
+
 static void usage(void) {
     fputs(
         "bitchat-linux — C client for the BitChat mesh\n"
         "Usage:\n"
-        "  bitchat-linux --decode       Decode hex BitchatPacket frame on stdin\n"
-        "  bitchat-linux --listen       Join the mesh and print received packets\n"
-        "  bitchat-linux --listen-test  Listen on the testnet service UUID\n"
-        "  bitchat-linux --self-test    Run built-in round-trip tests\n"
-        "  bitchat-linux --help         Show this help\n",
+        "  bitchat-linux --decode                       Decode hex BitchatPacket on stdin\n"
+        "  bitchat-linux --listen [--adapter <path>]    Join mainnet mesh via BLE\n"
+        "  bitchat-linux --listen-test [--adapter ...]  Listen on testnet service UUID\n"
+        "  bitchat-linux --listen-stream                Read length-prefixed frames on stdin\n"
+        "                                               (software mock for CI / no-BLE boxes)\n"
+        "  bitchat-linux --self-test                    Run built-in round-trip tests\n"
+        "  bitchat-linux --help                         Show this help\n"
+        "\n"
+        "  --adapter <path>   e.g. /org/bluez/hci1 — pick a specific BlueZ adapter.\n",
         stderr);
+}
+
+/* Parse --adapter from argv starting at index i. Returns path or NULL. */
+static const char *parse_adapter(int argc, char **argv, int i) {
+    if (i + 1 < argc && strcmp(argv[i], "--adapter") == 0) return argv[i + 1];
+    return NULL;
 }
 
 int main(int argc, char **argv) {
     if (argc < 2) { usage(); return 2; }
-    if (strcmp(argv[1], "--decode") == 0)      return cmd_decode();
-    if (strcmp(argv[1], "--listen") == 0)      return cmd_listen(0);
-    if (strcmp(argv[1], "--listen-test") == 0) return cmd_listen(1);
-    if (strcmp(argv[1], "--self-test") == 0)   return self_test();
+    if (strcmp(argv[1], "--decode") == 0)        return cmd_decode();
+    if (strcmp(argv[1], "--listen") == 0)        return cmd_listen(0, parse_adapter(argc, argv, 2));
+    if (strcmp(argv[1], "--listen-test") == 0)   return cmd_listen(1, parse_adapter(argc, argv, 2));
+    if (strcmp(argv[1], "--listen-stream") == 0) return cmd_listen_stream();
+    if (strcmp(argv[1], "--self-test") == 0)     return self_test();
     if (strcmp(argv[1], "--help") == 0 || strcmp(argv[1], "-h") == 0) {
         usage();
         return 0;

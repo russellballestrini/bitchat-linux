@@ -45,10 +45,12 @@ bc_ble_ctx_t *bc_ble_new(bc_ble_frame_cb_t frame_cb,
                          bc_ble_peer_cb_t  peer_cb,
                          void *user);
 
-/* Start scanning on the first powered adapter. If use_testnet is true, the
- * testnet service UUID is used instead of mainnet. Returns 0 on success,
- * a negative errno-style value on failure. */
-int bc_ble_start(bc_ble_ctx_t *ctx, int use_testnet);
+/* Start scanning. If adapter_path is NULL, auto-picks the first adapter
+ * reported by BlueZ; otherwise uses exactly the path supplied (e.g.
+ * "/org/bluez/hci1"). If use_testnet is true, the testnet service UUID
+ * is used instead of mainnet. Returns 0 on success, a negative
+ * errno-style value on failure. */
+int bc_ble_start(bc_ble_ctx_t *ctx, const char *adapter_path, int use_testnet);
 
 /* Blocking event loop. Returns 0 on clean shutdown (via bc_ble_stop), or
  * a negative errno on fatal error. */
