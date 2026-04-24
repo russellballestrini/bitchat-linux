@@ -305,19 +305,16 @@ static int on_async_connect_reply(sd_bus_message *m, void *ud, sd_bus_error *e) 
     (void)ud; (void)e;
     const sd_bus_error *err = sd_bus_message_get_error(m);
     if (err && err->name) {
-        ble_logf("ConnectProfile reply: %s: %s", err->name,
+        ble_logf("Connect reply: %s: %s", err->name,
                  err->message ? err->message : "");
     }
     return 0;
 }
 
-/* Dispatch an LE-only Connect via ConnectProfile(<service_uuid>). Plain
- * Device1.Connect probes BR/EDR as well, and on adapters that also hold
- * a classic audio pairing BlueZ will tear down the LE link it just made
- * when the BR/EDR probe returns br-connection-canceled. Targeting the
- * profile UUID skips that branch. Rate-limits per peer so we don't
- * trigger "Operation already in progress" by re-issuing while the
- * previous call is still pending. */
+/* Dispatch Device1.Connect with per-peer rate limiting. Without the
+ * cooldown, a flapping link makes us re-issue Connect inside BlueZ's
+ * pending window, earning "Operation already in progress" and
+ * preventing the link from ever settling. */
 static int device_connect_async(bc_ble_ctx_t *ctx, const char *path) {
     int idx = peer_index(ctx, path);
     uint64_t now = ble_now_ms();
@@ -330,10 +327,9 @@ static int device_connect_async(bc_ble_ctx_t *ctx, const char *path) {
     }
 
     int r = sd_bus_call_method_async(ctx->bus, NULL, BLUEZ_DEST, path,
-                                     DEVICE_IFACE, "ConnectProfile",
-                                     on_async_connect_reply, NULL,
-                                     "s", ctx->service_uuid);
-    if (r < 0) ble_logf("ConnectProfile(%s) dispatch failed: %s",
+                                     DEVICE_IFACE, "Connect",
+                                     on_async_connect_reply, NULL, NULL);
+    if (r < 0) ble_logf("Connect(%s) dispatch failed: %s",
                         path, strerror(-r));
     return r;
 }
