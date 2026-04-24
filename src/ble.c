@@ -30,6 +30,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <time.h>
 #include <systemd/sd-bus.h>
 
 #define BLUEZ_DEST        "org.bluez"
@@ -66,8 +67,12 @@ struct bc_ble_ctx {
 
     /* Remembered peer device paths that advertised our service UUID.
      * On Connected=0 for a known peer we re-dispatch Connect so the
-     * mesh link comes back up without needing a fresh advertisement. */
+     * mesh link comes back up without needing a fresh advertisement.
+     * last_connect_ms rate-limits reconnect dispatches per peer;
+     * without it BlueZ returns "Operation already in progress" and
+     * the connection never stabilises. */
     char        *matched_peers[BC_MAX_PEERS];
+    uint64_t     last_connect_ms[BC_MAX_PEERS];
     int          matched_peer_count;
 
     /* Peripheral role state */
@@ -266,12 +271,24 @@ static int adapter_start_discovery(bc_ble_ctx_t *ctx) {
     return r;
 }
 
-static int peer_known(bc_ble_ctx_t *ctx, const char *path) {
-    if (!path) return 0;
+#define BC_RECONNECT_MIN_GAP_MS 1500
+
+static uint64_t ble_now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+static int peer_index(bc_ble_ctx_t *ctx, const char *path) {
+    if (!path) return -1;
     for (int i = 0; i < ctx->matched_peer_count; i++) {
-        if (strcmp(ctx->matched_peers[i], path) == 0) return 1;
+        if (strcmp(ctx->matched_peers[i], path) == 0) return i;
     }
-    return 0;
+    return -1;
+}
+
+static int peer_known(bc_ble_ctx_t *ctx, const char *path) {
+    return peer_index(ctx, path) >= 0;
 }
 
 static void peer_remember(bc_ble_ctx_t *ctx, const char *path) {
@@ -279,24 +296,45 @@ static void peer_remember(bc_ble_ctx_t *ctx, const char *path) {
     if (ctx->matched_peer_count >= BC_MAX_PEERS) return;
     char *dup = strdup(path);
     if (!dup) return;
-    ctx->matched_peers[ctx->matched_peer_count++] = dup;
+    ctx->matched_peers[ctx->matched_peer_count]   = dup;
+    ctx->last_connect_ms[ctx->matched_peer_count] = 0;
+    ctx->matched_peer_count++;
 }
 
 static int on_async_connect_reply(sd_bus_message *m, void *ud, sd_bus_error *e) {
     (void)ud; (void)e;
     const sd_bus_error *err = sd_bus_message_get_error(m);
     if (err && err->name) {
-        ble_logf("Connect reply: %s: %s", err->name,
+        ble_logf("ConnectProfile reply: %s: %s", err->name,
                  err->message ? err->message : "");
     }
     return 0;
 }
 
+/* Dispatch an LE-only Connect via ConnectProfile(<service_uuid>). Plain
+ * Device1.Connect probes BR/EDR as well, and on adapters that also hold
+ * a classic audio pairing BlueZ will tear down the LE link it just made
+ * when the BR/EDR probe returns br-connection-canceled. Targeting the
+ * profile UUID skips that branch. Rate-limits per peer so we don't
+ * trigger "Operation already in progress" by re-issuing while the
+ * previous call is still pending. */
 static int device_connect_async(bc_ble_ctx_t *ctx, const char *path) {
+    int idx = peer_index(ctx, path);
+    uint64_t now = ble_now_ms();
+    if (idx >= 0) {
+        uint64_t last = ctx->last_connect_ms[idx];
+        if (last && now - last < BC_RECONNECT_MIN_GAP_MS) {
+            return 0;
+        }
+        ctx->last_connect_ms[idx] = now;
+    }
+
     int r = sd_bus_call_method_async(ctx->bus, NULL, BLUEZ_DEST, path,
-                                     DEVICE_IFACE, "Connect",
-                                     on_async_connect_reply, NULL, NULL);
-    if (r < 0) ble_logf("Connect(%s) dispatch failed: %s", path, strerror(-r));
+                                     DEVICE_IFACE, "ConnectProfile",
+                                     on_async_connect_reply, NULL,
+                                     "s", ctx->service_uuid);
+    if (r < 0) ble_logf("ConnectProfile(%s) dispatch failed: %s",
+                        path, strerror(-r));
     return r;
 }
 
